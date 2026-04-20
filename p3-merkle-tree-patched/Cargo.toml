@@ -1,0 +1,18 @@
+[package]
+name = "p3-merkle-tree"
+version = "0.2.0-succinct"
+edition = "2024"
+
+[dependencies]
+p3-commit = { git = "https://github.com/Plonky3/Plonky3", rev = "090b134a7e4f73191dad8849c410fcc38967a814" }
+p3-field = { git = "https://github.com/Plonky3/Plonky3", rev = "090b134a7e4f73191dad8849c410fcc38967a814" }
+p3-matrix = { git = "https://github.com/Plonky3/Plonky3", rev = "090b134a7e4f73191dad8849c410fcc38967a814" }
+p3-maybe-rayon = { git = "https://github.com/Plonky3/Plonky3", rev = "090b134a7e4f73191dad8849c410fcc38967a814" }
+p3-symmetric = { git = "https://github.com/Plonky3/Plonky3", rev = "090b134a7e4f73191dad8849c410fcc38967a814" }
+p3-util = { git = "https://github.com/Plonky3/Plonky3", rev = "090b134a7e4f73191dad8849c410fcc38967a814" }
+
+itertools = { version = "0.14.0", default-features = false, features = ["use_alloc"] }
+rand = { version = "0.10", default-features = false }
+serde = { version = "1.0", default-features = false, features = ["derive", "alloc"] }
+thiserror = { version = "2.0", default-features = false }
+tracing = { version = "0.1.37", default-features = false, features = ["attributes"] }

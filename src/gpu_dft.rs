@@ -18,13 +18,61 @@ use metal::{
 };
 use objc::rc::autoreleasepool;
 use p3_baby_bear::BabyBear;
+use rayon::prelude::*;
 use p3_dft::{Radix2DFTSmallBatch, TwoAdicSubgroupDft};
-use p3_field::{PrimeCharacteristicRing, TwoAdicField};
+use p3_field::{Field, PrimeCharacteristicRing, TwoAdicField};
 use p3_matrix::Matrix;
 use p3_matrix::dense::RowMajorMatrix;
 use p3_util::log2_strict_usize;
 
 const SHADER_MSL: &str = include_str!("../shaders/babybear_ntt.metal");
+
+/// Build the Poseidon2 BabyBear width-16 constants buffer (143 Montgomery u32s)
+/// by replicating the same RNG sampling as `Poseidon2::new_from_rng_128`.
+/// Layout: [0..64) ext_initial_rc, [64..77) int_rc, [77..141) ext_terminal_rc,
+///         [141] INV_256, [142] INV_2_27.
+fn build_poseidon2_constants(seed: u64) -> Vec<u32> {
+    use rand::{RngExt, SeedableRng, rngs::SmallRng};
+
+    let bb_to_u32 = |bb: BabyBear| -> u32 {
+        unsafe { std::mem::transmute::<BabyBear, u32>(bb) }
+    };
+
+    let mut rng = SmallRng::seed_from_u64(seed);
+    let mut buf = Vec::with_capacity(143);
+
+    // Replicate ExternalLayerConstants::new_from_rng(rounds_f=8, rng):
+    // initial_external_constants: 4 × [BabyBear; 16]
+    for _ in 0..4 {
+        let round: [BabyBear; 16] = rng.random();
+        for bb in round { buf.push(bb_to_u32(bb)); }
+    }
+    // terminal_external_constants: 4 × [BabyBear; 16]
+    let term_start = buf.len();
+    for _ in 0..4 {
+        let round: [BabyBear; 16] = rng.random();
+        for bb in round { buf.push(bb_to_u32(bb)); }
+    }
+    let terminal_constants: Vec<u32> = buf[term_start..].to_vec();
+    buf.truncate(term_start); // Remove terminal, insert internal first
+
+    // internal_constants: 13 BabyBear values
+    for _ in 0..13 {
+        let bb: BabyBear = rng.random();
+        buf.push(bb_to_u32(bb));
+    }
+
+    // Now append terminal constants
+    buf.extend_from_slice(&terminal_constants);
+
+    // INV_256 = (2^8)^{-1} mod p, in Montgomery form
+    buf.push(bb_to_u32(BabyBear::new(256).inverse()));
+    // INV_2_27 = (2^{27})^{-1} mod p, in Montgomery form
+    buf.push(bb_to_u32(BabyBear::new(1u32 << 27).inverse()));
+
+    assert_eq!(buf.len(), 143);
+    buf
+}
 
 
 /// Precompute twiddle factors in **Montgomery form** (raw `BabyBear` representation).
@@ -52,43 +100,162 @@ fn babybear_vec_to_u32(v: Vec<BabyBear>) -> Vec<u32> {
 }
 
 
+/// Memcpy that uses rayon for large transfers to increase DRAM bandwidth utilization.
+unsafe fn fast_memcpy(dst: *mut u8, src: *const u8, len: usize) {
+    const MIN_PARALLEL: usize = 16 * 1024 * 1024;
+    if len < MIN_PARALLEL {
+        unsafe { std::ptr::copy_nonoverlapping(src, dst, len) };
+        return;
+    }
+    let dst_slice = unsafe { std::slice::from_raw_parts_mut(dst, len) };
+    let src_slice = unsafe { std::slice::from_raw_parts(src, len) };
+    let n = rayon::current_num_threads().max(4);
+    let chunk = (len + n - 1) / n;
+    dst_slice.chunks_mut(chunk)
+        .zip(src_slice.chunks(chunk))
+        .collect::<Vec<_>>()
+        .into_par_iter()
+        .for_each(|(d, s)| d.copy_from_slice(s));
+}
+
+/// Like `fast_memcpy` but uses ARM64 non-temporal loads (LDNP) to read
+/// GPU-written memory without triggering CPU cache-line fills.  This avoids
+/// the coherency stall that occurs when normal loads try to pull GPU-dirty
+/// cache lines into the CPU L1/L2.
+#[cfg(target_arch = "aarch64")]
+unsafe fn fast_memcpy_from_gpu(dst: *mut u8, src: *const u8, len: usize) {
+    const MIN_PARALLEL: usize = 16 * 1024 * 1024;
+    if len < MIN_PARALLEL {
+        nontemporal_copy(dst, src, len);
+        return;
+    }
+    let n = rayon::current_num_threads().max(4);
+    let chunk = (len + n - 1) / n;
+    let dst_slice = unsafe { std::slice::from_raw_parts_mut(dst, len) };
+    let src_slice = unsafe { std::slice::from_raw_parts(src, len) };
+    dst_slice.chunks_mut(chunk)
+        .zip(src_slice.chunks(chunk))
+        .collect::<Vec<_>>()
+        .into_par_iter()
+        .for_each(|(d, s)| unsafe {
+            nontemporal_copy(d.as_mut_ptr(), s.as_ptr(), s.len());
+        });
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn nontemporal_copy(dst: *mut u8, src: *const u8, len: usize) {
+    let mut i = 0usize;
+    while i + 64 <= len {
+        core::arch::asm!(
+            "ldnp q0, q1, [{src}]",
+            "ldnp q2, q3, [{src}, #32]",
+            "stnp q0, q1, [{dst}]",
+            "stnp q2, q3, [{dst}, #32]",
+            src = in(reg) src.add(i),
+            dst = in(reg) dst.add(i),
+            out("v0") _,
+            out("v1") _,
+            out("v2") _,
+            out("v3") _,
+        );
+        i += 64;
+    }
+    if i < len {
+        std::ptr::copy_nonoverlapping(src.add(i), dst.add(i), len - i);
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+unsafe fn fast_memcpy_from_gpu(dst: *mut u8, src: *const u8, len: usize) {
+    fast_memcpy(dst, src, len);
+}
+
 /// Metal-backed DFT for BabyBear (macOS).
 /// Falls back to CPU for small sizes or if the GPU fails.
 pub struct MetalBabyBearDft {
     cpu: Radix2DFTSmallBatch<BabyBear>,
     gpu_min_log_n: u32,
-    device: Device,
+    pub device: Device,
     queue: metal::CommandQueue,
     bitrev_ps: ComputePipelineState,
+    bitrev_gather_ps: ComputePipelineState,
+    dif_r16_oop_ps: ComputePipelineState,
     butterfly_ps: ComputePipelineState,
     butterfly_r4_ps: ComputePipelineState,
     butterfly_r8_ps: ComputePipelineState,
     shared_mem_ps: ComputePipelineState,
+    shared_mem_gs_ps: ComputePipelineState,
+    stockham_ps: ComputePipelineState,
+    stockham_global_r2_ps: ComputePipelineState,
+    twiddle_transpose_ps: ComputePipelineState,
+    dif_r32_ps: ComputePipelineState,
+    dif_r16_ps: ComputePipelineState,
+    dif_r8_ps: ComputePipelineState,
+    dif_r4_ps: ComputePipelineState,
+    dif_r2_ps: ComputePipelineState,
+    dif_r32_bitrev_ps: ComputePipelineState,
+    dif_r16_bitrev_ps: ComputePipelineState,
+    dif_r8_bitrev_ps: ComputePipelineState,
+    dif_r4_bitrev_ps: ComputePipelineState,
+    dif_r2_bitrev_ps: ComputePipelineState,
+    dif_shared_bitrev_ps: ComputePipelineState,
     /// Hard upper bound on the shared-memory block log from the device
     /// (max threads per threadgroup). The kernel tiles columns internally,
     /// so the actual `log_block` is just `min(this, log_n)`.
     max_log_shared_block: u32,
+    /// Stockham radix-4 processes 4 elements per thread, so the block
+    /// size is 4× larger than max threads:  log_block = max_log_shared_block + 2.
+    max_log_stockham_block: u32,
     twiddle_bufs: Mutex<HashMap<u32, Buffer>>,
+    /// Cached temporary buffer for four-step FFT (avoids per-call allocation).
+    temp_buf_cache: Mutex<Option<Buffer>>,
+    /// Cached data buffer (avoids per-call allocation).
+    data_buf_cache: Mutex<Option<Buffer>>,
+    // Poseidon2 Merkle hashing pipeline states
+    poseidon2_hash_leaves_ps: ComputePipelineState,
+    poseidon2_compress_ps: ComputePipelineState,
+    /// Poseidon2 round constants buffer (143 u32 values in Montgomery form).
+    poseidon2_rc_buf: Buffer,
 }
 
 impl Clone for MetalBabyBearDft {
     fn clone(&self) -> Self {
-        Self::new_with_min_log_n(self.cpu.clone(), self.gpu_min_log_n)
+        Self::new_with_params(self.cpu.clone(), self.gpu_min_log_n, Self::DEFAULT_POSEIDON2_SEED)
     }
 }
 
 impl Default for MetalBabyBearDft {
     fn default() -> Self {
-        Self::new_with_min_log_n(Radix2DFTSmallBatch::default(), 10)
+        Self::new_with_params(Radix2DFTSmallBatch::default(), Self::DEFAULT_GPU_MIN_LOG_N, Self::DEFAULT_POSEIDON2_SEED)
     }
 }
 
 impl MetalBabyBearDft {
+    /// Minimum log_n for GPU dispatch. The 64MB total-data threshold (in
+    /// try_gpu_dft_inplace) is the primary gate; this only guards against
+    /// degenerate cases with very few NTT stages but huge width.
+    const DEFAULT_GPU_MIN_LOG_N: u32 = 14;
+    /// Default Poseidon2 RNG seed (must match the seed used to construct the permutation).
+    const DEFAULT_POSEIDON2_SEED: u64 = 1;
+
     pub fn new(max_fft_size: usize) -> Self {
-        Self::new_with_min_log_n(Radix2DFTSmallBatch::new(max_fft_size), 10)
+        Self::new_with_params(
+            Radix2DFTSmallBatch::new(max_fft_size),
+            Self::DEFAULT_GPU_MIN_LOG_N,
+            Self::DEFAULT_POSEIDON2_SEED,
+        )
     }
 
-    fn new_with_min_log_n(cpu: Radix2DFTSmallBatch<BabyBear>, gpu_min_log_n: u32) -> Self {
+    pub fn new_with_poseidon2_seed(max_fft_size: usize, poseidon2_seed: u64) -> Self {
+        Self::new_with_params(
+            Radix2DFTSmallBatch::new(max_fft_size),
+            Self::DEFAULT_GPU_MIN_LOG_N,
+            poseidon2_seed,
+        )
+    }
+
+    fn new_with_params(cpu: Radix2DFTSmallBatch<BabyBear>, gpu_min_log_n: u32, poseidon2_seed: u64) -> Self {
         let device = Device::system_default().expect("Metal device");
         let queue = device.new_command_queue();
         let opts = CompileOptions::new();
@@ -106,13 +273,43 @@ impl MetalBabyBearDft {
         };
 
         let bitrev_ps = make_ps("bb_ntt_bitrev");
+        let bitrev_gather_ps = make_ps("bb_bitrev_gather");
+        let dif_r16_oop_ps = make_ps("bb_dif_r16_oop");
         let butterfly_ps = make_ps("bb_ntt_butterfly");
         let butterfly_r4_ps = make_ps("bb_ntt_butterfly_r4");
         let butterfly_r8_ps = make_ps("bb_ntt_butterfly_r8");
         let shared_mem_ps = make_ps("bb_ntt_shared_mem");
+        let shared_mem_gs_ps = make_ps("bb_ntt_shared_mem_gs");
+        let stockham_ps = make_ps("bb_ntt_stockham");
+        let stockham_global_r2_ps = make_ps("bb_stockham_global_r2");
+        let twiddle_transpose_ps = make_ps("bb_ntt_twiddle_transpose");
+        let dif_r32_ps = make_ps("bb_dif_r32");
+        let dif_r16_ps = make_ps("bb_dif_r16");
+        let dif_r8_ps = make_ps("bb_dif_r8");
+        let dif_r4_ps = make_ps("bb_dif_r4");
+        let dif_r2_ps = make_ps("bb_dif_r2");
+        let dif_r32_bitrev_ps = make_ps("bb_dif_r32_bitrev");
+        let dif_r16_bitrev_ps = make_ps("bb_dif_r16_bitrev");
+        let dif_r8_bitrev_ps = make_ps("bb_dif_r8_bitrev");
+        let dif_r4_bitrev_ps = make_ps("bb_dif_r4_bitrev");
+        let dif_r2_bitrev_ps = make_ps("bb_dif_r2_bitrev");
+        let dif_shared_bitrev_ps = make_ps("bb_dif_shared_bitrev");
+        let poseidon2_hash_leaves_ps = make_ps("poseidon2_hash_leaves");
+        let poseidon2_compress_ps = make_ps("poseidon2_merkle_compress");
+
+        let p2_rc = build_poseidon2_constants(poseidon2_seed);
+        let poseidon2_rc_buf = device.new_buffer_with_data(
+            p2_rc.as_ptr().cast(),
+            (p2_rc.len() * size_of::<u32>()) as u64,
+            MTLResourceOptions::CPUCacheModeDefaultCache | MTLResourceOptions::StorageModeShared,
+        );
 
         let max_tg = shared_mem_ps.max_total_threads_per_threadgroup() as u32;
         let max_log_shared_block = max_tg.min(1024).ilog2();
+        let max_stockham_tg = stockham_ps.max_total_threads_per_threadgroup() as u32;
+        let max_log_stockham_block = max_stockham_tg.min(1024).ilog2() + 2;
+
+        eprintln!("[Metal] max_tg={max_tg} max_log_shared={max_log_shared_block} stockham_tg={max_stockham_tg} max_log_stockham={max_log_stockham_block}");
 
         Self {
             cpu,
@@ -120,12 +317,35 @@ impl MetalBabyBearDft {
             device,
             queue,
             bitrev_ps,
+            bitrev_gather_ps,
+            dif_r16_oop_ps,
             butterfly_ps,
             butterfly_r4_ps,
             butterfly_r8_ps,
             shared_mem_ps,
+            shared_mem_gs_ps,
+            stockham_ps,
+            stockham_global_r2_ps,
+            twiddle_transpose_ps,
+            dif_r32_ps,
+            dif_r16_ps,
+            dif_r8_ps,
+            dif_r4_ps,
+            dif_r2_ps,
+            dif_r32_bitrev_ps,
+            dif_r16_bitrev_ps,
+            dif_r8_bitrev_ps,
+            dif_r4_bitrev_ps,
+            dif_r2_bitrev_ps,
+            dif_shared_bitrev_ps,
             max_log_shared_block,
+            max_log_stockham_block,
             twiddle_bufs: Mutex::new(HashMap::new()),
+            temp_buf_cache: Mutex::new(None),
+            data_buf_cache: Mutex::new(None),
+            poseidon2_hash_leaves_ps,
+            poseidon2_compress_ps,
+            poseidon2_rc_buf,
         }
     }
 
@@ -151,52 +371,1000 @@ impl MetalBabyBearDft {
         self.max_log_shared_block.min(log_n)
     }
 
-    fn try_gpu_dft_batch(&self, mat: &RowMajorMatrix<BabyBear>) -> Option<RowMajorMatrix<BabyBear>> {
-        let height = mat.height();
-        let width = mat.width();
+    fn use_four_step(&self, _log_n: u32) -> bool {
+        false
+    }
+
+    /// Acquire a buffer from the cache or allocate a new one. The buffer
+    /// is guaranteed to be at least `bytes` long.
+    fn acquire_buf(cache: &Mutex<Option<Buffer>>, device: &metal::DeviceRef, bytes: u64) -> Buffer {
+        let opts =
+            MTLResourceOptions::CPUCacheModeDefaultCache | MTLResourceOptions::StorageModeShared;
+        let mut slot = cache.lock().expect("buf mutex");
+        match slot.take() {
+            Some(b) if b.length() >= bytes => b,
+            _ => device.new_buffer(bytes, opts),
+        }
+    }
+
+    fn release_buf(cache: &Mutex<Option<Buffer>>, buf: Buffer) {
+        *cache.lock().expect("buf mutex") = Some(buf);
+    }
+
+    /// Run a single Poseidon2 permutation on GPU and return the result (for testing).
+    #[cfg(test)]
+    fn gpu_poseidon2_permute(&self, input: &[BabyBear; 16]) -> [BabyBear; 16] {
+        let opts = MTLResourceOptions::CPUCacheModeDefaultCache | MTLResourceOptions::StorageModeShared;
+        let data_buf = self.device.new_buffer_with_data(
+            input.as_ptr().cast(),
+            (16 * size_of::<u32>()) as u64,
+            opts,
+        );
+        let out_buf = self.device.new_buffer((8 * size_of::<u32>()) as u64, opts);
+
+        // We'll use hash_leaves with 1 leaf of width 16 to test the permutation.
+        // PaddingFreeSponge: absorbs 8, permutes, absorbs next 8, permutes, squeezes 8.
+        // But for a direct permutation test, we need the full 16-element state.
+        // Let's use compress instead: left=input[0..8], right=input[8..16], output=perm(input)[0..8].
+        autoreleasepool(|| {
+            let cmd = self.queue.new_command_buffer();
+            let enc = cmd.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&self.poseidon2_compress_ps);
+            enc.set_buffer(0, Some(&data_buf), 0);
+            enc.set_buffer(1, Some(&out_buf), 0);
+            enc.set_buffer(2, Some(&self.poseidon2_rc_buf), 0);
+            let num_pairs = 1u32;
+            enc.set_bytes(3, size_of::<u32>() as u64, (&num_pairs as *const u32).cast());
+            enc.dispatch_threads(
+                MTLSize { width: 1, height: 1, depth: 1 },
+                MTLSize { width: 1, height: 1, depth: 1 },
+            );
+            enc.end_encoding();
+            cmd.commit();
+            cmd.wait_until_completed();
+        });
+
+        // Read only the first 8 elements (truncated permutation output)
+        let mut result = [BabyBear::ZERO; 16];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                out_buf.contents() as *const BabyBear,
+                result.as_mut_ptr(),
+                8,
+            );
+        }
+        result
+    }
+
+    /// Build a full Merkle tree on GPU from leaf data.
+    /// Returns (leaf_digests, all_layers) where each layer is a vec of 8-element digests.
+    pub fn gpu_merkle_tree(
+        &self,
+        data_buf: &metal::BufferRef,
+        num_leaves: u32,
+        leaf_width: u32,
+    ) -> Vec<Vec<u32>> {
+        let opts = MTLResourceOptions::CPUCacheModeDefaultCache | MTLResourceOptions::StorageModeShared;
+        let set_u32 = |enc: &ComputeCommandEncoderRef, index: u64, val: u32| {
+            enc.set_bytes(index, size_of::<u32>() as u64, (&val as *const u32).cast());
+        };
+
+        let digest_elems = 8u32;
+        let mut layers: Vec<Buffer> = Vec::new();
+
+        // Layer 0: hash leaves
+        let leaf_digest_buf = self.device.new_buffer(
+            (num_leaves as u64) * (digest_elems as u64) * (size_of::<u32>() as u64), opts,
+        );
+        autoreleasepool(|| {
+            let cmd = self.queue.new_command_buffer();
+            let enc = cmd.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&self.poseidon2_hash_leaves_ps);
+            enc.set_buffer(0, Some(data_buf), 0);
+            enc.set_buffer(1, Some(&leaf_digest_buf), 0);
+            enc.set_buffer(2, Some(&self.poseidon2_rc_buf), 0);
+            set_u32(&enc, 3, num_leaves);
+            set_u32(&enc, 4, leaf_width);
+            let max_tg = self.poseidon2_hash_leaves_ps.max_total_threads_per_threadgroup() as u64;
+            enc.dispatch_threads(
+                MTLSize { width: num_leaves as u64, height: 1, depth: 1 },
+                MTLSize { width: max_tg.min(256), height: 1, depth: 1 },
+            );
+            enc.end_encoding();
+            cmd.commit();
+            cmd.wait_until_completed();
+        });
+        layers.push(leaf_digest_buf);
+
+        // Compress layers until we have 1 digest (root)
+        let mut current_count = num_leaves;
+        while current_count > 1 {
+            let pairs = current_count / 2;
+            let parent_buf = self.device.new_buffer(
+                (pairs as u64) * (digest_elems as u64) * (size_of::<u32>() as u64), opts,
+            );
+            let child_buf = layers.last().unwrap();
+            autoreleasepool(|| {
+                let cmd = self.queue.new_command_buffer();
+                let enc = cmd.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(&self.poseidon2_compress_ps);
+                enc.set_buffer(0, Some(child_buf), 0);
+                enc.set_buffer(1, Some(&parent_buf), 0);
+                enc.set_buffer(2, Some(&self.poseidon2_rc_buf), 0);
+                set_u32(&enc, 3, pairs);
+                let max_tg = self.poseidon2_compress_ps.max_total_threads_per_threadgroup() as u64;
+                enc.dispatch_threads(
+                    MTLSize { width: pairs as u64, height: 1, depth: 1 },
+                    MTLSize { width: max_tg.min(256), height: 1, depth: 1 },
+                );
+                enc.end_encoding();
+                cmd.commit();
+                cmd.wait_until_completed();
+            });
+            layers.push(parent_buf);
+            current_count = pairs;
+        }
+
+        // Read back all layers as u32 vecs
+        layers.iter().map(|buf| {
+            let count = buf.length() as usize / size_of::<u32>();
+            let mut v = vec![0u32; count];
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    buf.contents() as *const u32,
+                    v.as_mut_ptr(),
+                    count,
+                );
+            }
+            v
+        }).collect()
+    }
+
+    /// Build Merkle digest layers on GPU from a raw BabyBear slice.
+    /// The slice must contain `height * width` elements in row-major order.
+    pub fn gpu_build_merkle_digests_raw(
+        &self,
+        data: &[BabyBear],
+        height: usize,
+        width: usize,
+    ) -> (
+        p3_symmetric::MerkleCap<BabyBear, [BabyBear; 8]>,
+        Vec<Vec<[BabyBear; 8]>>,
+        Vec<usize>,
+    ) {
+        let total_bytes = (height * width * size_of::<u32>()) as u64;
+
+        let opts = MTLResourceOptions::CPUCacheModeDefaultCache
+            | MTLResourceOptions::StorageModeShared;
+        let data_buf = self.device.new_buffer_with_data(
+            data.as_ptr().cast(),
+            total_bytes,
+            opts,
+        );
+
+        let raw_layers = self.gpu_merkle_tree(&data_buf, height as u32, width as u32);
+
+        let digest_layers: Vec<Vec<[BabyBear; 8]>> = raw_layers
+            .iter()
+            .map(|layer_u32| {
+                layer_u32
+                    .chunks_exact(8)
+                    .map(|chunk| {
+                        let mut digest = [BabyBear::ZERO; 8];
+                        for (i, &v) in chunk.iter().enumerate() {
+                            digest[i] = unsafe { std::mem::transmute::<u32, BabyBear>(v) };
+                        }
+                        digest
+                    })
+                    .collect()
+            })
+            .collect();
+
+        let num_layers = digest_layers.len();
+        let arity_schedule = vec![2usize; num_layers.saturating_sub(1)];
+
+        let root_digest = digest_layers.last().unwrap()[0];
+        let cap = p3_symmetric::MerkleCap::new(vec![root_digest]);
+
+        (cap, digest_layers, arity_schedule)
+    }
+
+    /// Build Merkle digest layers on GPU from a row-major matrix.
+    pub fn gpu_build_merkle_digests(
+        &self,
+        mat: &RowMajorMatrix<BabyBear>,
+    ) -> (
+        p3_symmetric::MerkleCap<BabyBear, [BabyBear; 8]>,
+        Vec<Vec<[BabyBear; 8]>>,
+        Vec<usize>,
+    ) {
+        self.gpu_build_merkle_digests_raw(&mat.values, mat.height(), mat.width())
+    }
+
+    /// Commit a matrix using GPU Merkle: hash all rows, build compression tree.
+    /// Returns `(MerkleCap, MerkleTree)` compatible with plonky3's `MerkleTreeMmcs`.
+    pub fn gpu_commit_matrix(
+        &self,
+        mat: RowMajorMatrix<BabyBear>,
+    ) -> (
+        p3_symmetric::MerkleCap<BabyBear, [BabyBear; 8]>,
+        p3_merkle_tree::MerkleTree<BabyBear, BabyBear, RowMajorMatrix<BabyBear>, 2, 8>,
+    ) {
+        let (cap, digest_layers, arity_schedule) = self.gpu_build_merkle_digests(&mat);
+        let tree = p3_merkle_tree::MerkleTree::from_parts(
+            vec![mat],
+            digest_layers,
+            arity_schedule,
+        );
+        (cap, tree)
+    }
+
+    /// Try to wrap the Vec's memory directly as a Metal buffer (zero-copy).
+    /// Requires page-aligned pointer and page-aligned size.
+    fn try_zero_copy_buffer(&self, values: &mut Vec<BabyBear>, total_bytes: u64) -> Option<Buffer> {
+        const PAGE_SIZE: usize = 16384;
+        let ptr = values.as_mut_ptr() as usize;
+        let len = total_bytes as usize;
+        if ptr % PAGE_SIZE != 0 || len % PAGE_SIZE != 0 {
+            return None;
+        }
+        let buf = self.device.new_buffer_with_bytes_no_copy(
+            values.as_mut_ptr().cast(),
+            total_bytes,
+            MTLResourceOptions::CPUCacheModeDefaultCache
+                | MTLResourceOptions::StorageModeShared,
+            None,
+        );
+        Some(buf)
+    }
+
+    fn try_gpu_dft_inplace(&self, values: &mut Vec<BabyBear>, height: usize, width: usize) -> Option<()> {
         let log_n = log2_strict_usize(height) as u32;
         if log_n < self.gpu_min_log_n {
+            return None;
+        }
+        // GPU wins on Apple Silicon unified memory when total data >= 64MB.
+        // Below that, dispatch overhead and cache coherency costs exceed compute savings.
+        // Benchmarked crossover: 16x64 (16MB) GPU 50% slower, 18x64 (64MB) GPU 20% faster.
+        let total_bytes_val = height * width * size_of::<u32>();
+        if total_bytes_val < 64 * 1024 * 1024 {
             return None;
         }
 
         let total = height * width;
         let total_bytes = (total * size_of::<u32>()) as u64;
-        let opts =
-            MTLResourceOptions::CPUCacheModeDefaultCache | MTLResourceOptions::StorageModeShared;
         let tw = self.twiddle_buffer(log_n);
 
-        // Single memcpy into Metal buffer — no clone, no intermediate Vec.
-        // BabyBear is #[repr(transparent)] over u32 (Montgomery form).
-        let data_buf =
-            self.device
-                .new_buffer_with_data(mat.values.as_ptr().cast(), total_bytes, opts);
+        // Best path: zero-copy wrap values for both input AND output.
+        // 1. First R16 OOP: zc(values) → managed  [reads input from zc]
+        // 2. Remaining DIF: in-place on managed    [fast GPU memory]
+        // 3. Bitrev gather: managed → zc(values)   [coalesced writes back]
+        // No CPU memcpy at all — result lands directly in values.
+        if let Some(zc_buf) = self.try_zero_copy_buffer(values, total_bytes) {
+            let data_buf = Self::acquire_buf(&self.data_buf_cache, &self.device, total_bytes);
+            let ok = autoreleasepool(|| {
+                let cmd = self.queue.new_command_buffer();
+                let enc = cmd.new_compute_command_encoder();
+                self.encode_dif_ntt_zc(
+                    &enc, &zc_buf, &data_buf, &zc_buf, &tw,
+                    log_n, height as u32, width as u32,
+                );
+                enc.end_encoding();
+                cmd.commit();
+                cmd.wait_until_completed();
+                cmd.status() != MTLCommandBufferStatus::Error
+            });
+            Self::release_buf(&self.data_buf_cache, data_buf);
+            if ok { return Some(()); }
+        }
 
-        autoreleasepool(|| {
+        // Fallback: managed buffers with memcpy both ways.
+        let data_buf = Self::acquire_buf(&self.data_buf_cache, &self.device, total_bytes);
+        unsafe {
+            fast_memcpy(
+                data_buf.contents() as *mut u8,
+                values.as_ptr().cast::<u8>(),
+                total_bytes as usize,
+            );
+        }
+        let dst_buf = Self::acquire_buf(&self.temp_buf_cache, &self.device, total_bytes);
+
+        let ok = autoreleasepool(|| {
             let cmd = self.queue.new_command_buffer();
             let enc = cmd.new_compute_command_encoder();
-            self.encode_batch_ntt(&enc, &data_buf, &tw, log_n, height as u32, width as u32);
+            self.encode_dif_ntt(
+                &enc, &data_buf, &dst_buf, &tw,
+                log_n, height as u32, width as u32,
+            );
             enc.end_encoding();
             cmd.commit();
             cmd.wait_until_completed();
-            (cmd.status() != MTLCommandBufferStatus::Error).then_some(())
-        })?;
+            cmd.status() != MTLCommandBufferStatus::Error
+        });
 
-        // Single memcpy out of Metal buffer → result.
-        let mut result = Vec::<BabyBear>::with_capacity(total);
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                data_buf.contents() as *const BabyBear,
-                result.as_mut_ptr(),
-                total,
-            );
-            result.set_len(total);
+        if !ok {
+            Self::release_buf(&self.data_buf_cache, data_buf);
+            Self::release_buf(&self.temp_buf_cache, dst_buf);
+            return None;
         }
-        Some(RowMajorMatrix::new(result, width))
+
+        unsafe {
+            fast_memcpy_from_gpu(
+                values.as_mut_ptr().cast::<u8>(),
+                dst_buf.contents() as *const u8,
+                total_bytes as usize,
+            );
+        }
+
+        Self::release_buf(&self.data_buf_cache, data_buf);
+        Self::release_buf(&self.temp_buf_cache, dst_buf);
+        Some(())
     }
 
-    /// Encode the full batched NTT (bitrev + shared-mem fused stages +
-    /// global butterfly stages) into `enc`.
-    fn encode_batch_ntt(
+    /// Dispatch the Stockham radix-4 kernel.
+    /// Computes a `block_size`-point NTT on each contiguous block of `block_size` rows.
+    /// No bit-reversal dispatch needed — Stockham autosort handles ordering.
+    fn dispatch_stockham(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        buf: &metal::BufferRef,
+        twiddles: &metal::BufferRef,
+        height: u32,
+        width: u32,
+        log_block: u32,
+    ) {
+        let block_size = 1u32 << log_block;
+        let threads = block_size >> 2; // radix-4: 4 elements per thread
+        let num_blocks = height / block_size;
+        let set_u32 = |enc: &ComputeCommandEncoderRef, index: u64, val: u32| {
+            enc.set_bytes(index, size_of::<u32>() as u64, (&val as *const u32).cast());
+        };
+
+        enc.set_compute_pipeline_state(&self.stockham_ps);
+        enc.set_buffer(0, Some(buf), 0);
+        enc.set_buffer(1, Some(twiddles), 0);
+        set_u32(enc, 2, height);
+        set_u32(enc, 3, width);
+        set_u32(enc, 4, log_block);
+
+        enc.dispatch_thread_groups(
+            MTLSize { width: num_blocks as u64, height: 1, depth: 1 },
+            MTLSize { width: threads as u64, height: 1, depth: 1 },
+        );
+    }
+
+    /// Dispatch a shared-memory kernel on `buf`, with optional bit-reversal.
+    fn dispatch_shared_mem(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        buf: &metal::BufferRef,
+        twiddles: &metal::BufferRef,
+        height: u32,
+        width: u32,
+        log_block: u32,
+        do_bitrev: u32,
+    ) {
+        let block_size = 1u32 << log_block;
+        let set_u32 = |enc: &ComputeCommandEncoderRef, index: u64, val: u32| {
+            enc.set_bytes(index, size_of::<u32>() as u64, (&val as *const u32).cast());
+        };
+
+        enc.set_compute_pipeline_state(&self.shared_mem_ps);
+        enc.set_buffer(0, Some(buf), 0);
+        enc.set_buffer(1, Some(twiddles), 0);
+        set_u32(enc, 2, height);
+        set_u32(enc, 3, width);
+        set_u32(enc, 4, log_block);
+        set_u32(enc, 5, do_bitrev);
+
+        let num_blocks = height / block_size;
+        enc.dispatch_thread_groups(
+            MTLSize { width: num_blocks as u64, height: 1, depth: 1 },
+            MTLSize { width: block_size as u64, height: 1, depth: 1 },
+        );
+    }
+
+    /// Dispatch the gather-scatter shared-memory DFT kernel.
+    fn dispatch_shared_mem_gs(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        input: &metal::BufferRef,
+        output: &metal::BufferRef,
+        twiddles: &metal::BufferRef,
+        height: u32,
+        width: u32,
+        log_block: u32,
+        load_stride: u32,
+        store_stride: u32,
+        apply_twiddle: u32,
+    ) {
+        let block_size = 1u32 << log_block;
+        let num_blocks = height / block_size;
+        let set_u32 = |enc: &ComputeCommandEncoderRef, index: u64, val: u32| {
+            enc.set_bytes(index, size_of::<u32>() as u64, (&val as *const u32).cast());
+        };
+
+        enc.set_compute_pipeline_state(&self.shared_mem_gs_ps);
+        enc.set_buffer(0, Some(input), 0);
+        enc.set_buffer(1, Some(output), 0);
+        enc.set_buffer(2, Some(twiddles), 0);
+        set_u32(enc, 3, height);
+        set_u32(enc, 4, width);
+        set_u32(enc, 5, log_block);
+        set_u32(enc, 6, load_stride);
+        set_u32(enc, 7, store_stride);
+        set_u32(enc, 8, apply_twiddle);
+
+        enc.dispatch_thread_groups(
+            MTLSize { width: num_blocks as u64, height: 1, depth: 1 },
+            MTLSize { width: block_size as u64, height: 1, depth: 1 },
+        );
+    }
+
+    /// Pure Stockham NTT: shared-mem Stockham for first 12 stages, then
+    /// Stockham global R2 for remaining stages with ping-pong buffers.
+    /// No bit-reversal needed. All memory accesses are coalesced.
+    fn encode_stockham_full(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        data_buf: &metal::BufferRef,
+        temp_buf: &metal::BufferRef,
+        twiddles: &metal::BufferRef,
+        log_n: u32,
+        height: u32,
+        width: u32,
+    ) {
+        let log_block = self.max_log_stockham_block.min(log_n);
+
+        // Phase 1: Stockham shared-mem for first log_block stages (in-place on data_buf)
+        self.dispatch_stockham(enc, data_buf, twiddles, height, width, log_block);
+
+        // Phase 2: Stockham global R2 for remaining stages (ping-pong)
+        let set_u32 = |enc: &ComputeCommandEncoderRef, index: u64, val: u32| {
+            enc.set_bytes(index, size_of::<u32>() as u64, (&val as *const u32).cast());
+        };
+        let half_n = height >> 1;
+        let max_tg = self.stockham_global_r2_ps.max_total_threads_per_threadgroup() as u32;
+        let tg_w = width.min(32);
+
+        let mut src: &metal::BufferRef = data_buf;
+        let mut dst: &metal::BufferRef = temp_buf;
+
+        for stage in log_block..log_n {
+            let p = 1u32 << stage;
+            let src_res: &metal::ResourceRef = src.deref();
+            enc.memory_barrier_with_resources(&[src_res]);
+
+            enc.set_compute_pipeline_state(&self.stockham_global_r2_ps);
+            enc.set_buffer(0, Some(src), 0);
+            enc.set_buffer(1, Some(dst), 0);
+            enc.set_buffer(2, Some(twiddles), 0);
+            set_u32(enc, 3, height);
+            set_u32(enc, 4, width);
+            set_u32(enc, 5, p);
+
+            enc.dispatch_threads(
+                MTLSize { width: width as u64, height: half_n as u64, depth: 1 },
+                MTLSize {
+                    width: tg_w as u64,
+                    height: (max_tg / tg_w).min(half_n) as u64,
+                    depth: 1,
+                },
+            );
+
+            std::mem::swap(&mut src, &mut dst);
+        }
+    }
+
+    /// Four-step FFT: 2 dispatches with balanced split and fused twiddle.
+    ///
+    /// Cooley-Tukey decomposition N = N1 × N2 (balanced: N1 ≈ N2 ≈ √N):
+    ///   1. Column DFTs: stride-N2 gather → N1-point DFT → contiguous store
+    ///      data_buf → temp_buf
+    ///   2. Twiddle + Row DFTs: stride-N1 gather from temp (with fused
+    ///      twiddle ω_N^{k1·n2}) → N2-point DFT → stride-N1 scatter
+    ///      temp_buf → data_buf   (scatter produces natural output order)
+    /// Result lives in `data_buf`.
+    fn encode_four_step_ntt(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        data_buf: &metal::BufferRef,
+        temp_buf: &metal::BufferRef,
+        twiddles: &metal::BufferRef,
+        log_n: u32,
+        height: u32,
+        width: u32,
+    ) {
+        let log_n1 = log_n / 2;
+        let log_n2 = log_n - log_n1;
+        let n1 = 1u32 << log_n1;
+        let n2 = 1u32 << log_n2;
+
+        // Step 1: N2 groups of N1-point column DFTs.
+        // Gather from data_buf (stride N2), contiguous store to temp_buf.
+        self.dispatch_shared_mem_gs(
+            enc, data_buf, temp_buf, twiddles,
+            height, width, log_n1,
+            n2, // load_stride = N2 (gather columns)
+            1,  // store_stride = 1 (contiguous blocks)
+            0,  // no twiddle
+        );
+
+        // Step 2: N1 groups of N2-point row DFTs with fused twiddle.
+        // Gather from temp_buf (stride N1) with twiddle ω_N^{k1·n2},
+        // scatter-store to data_buf (stride N1) → natural output order.
+        {
+            let res: &metal::ResourceRef = temp_buf.deref();
+            enc.memory_barrier_with_resources(&[res]);
+            self.dispatch_shared_mem_gs(
+                enc, temp_buf, data_buf, twiddles,
+                height, width, log_n2,
+                n1, // load_stride = N1 (gather rows from column-DFT output)
+                n1, // store_stride = N1 (scatter → natural order)
+                1,  // apply twiddle ω_N^{tgid·tid}
+            );
+        }
+    }
+
+    /// DIF NTT using R16/R8/R4/R2 kernels.
+    /// The LAST dispatch fuses bit-reversal into its write (out-of-place).
+    /// `dst_buf` receives the natural-order result.
+    fn encode_dif_ntt(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        data: &metal::BufferRef,
+        dst: &metal::BufferRef,
+        twiddles: &metal::BufferRef,
+        log_n: u32,
+        height: u32,
+        width: u32,
+    ) {
+        let set_u32 = |enc: &ComputeCommandEncoderRef, index: u64, val: u32| {
+            enc.set_bytes(index, size_of::<u32>() as u64, (&val as *const u32).cast());
+        };
+
+        let tg_w = width.min(32);
+        let mut dif_stage = 0u32;
+        let total_stages = log_n;
+
+        let final_stages = match total_stages % 4 {
+            0 => 4,
+            1 => 1,
+            2 => 2,
+            3 => 3,
+            _ => unreachable!(),
+        };
+        let final_dif_stage = total_stages - final_stages;
+
+        while dif_stage < final_dif_stage {
+            let gap = final_dif_stage - dif_stage;
+            if gap >= 4 {
+                let num_units = height >> 4;
+                let max_tg = self.dif_r16_ps.max_total_threads_per_threadgroup() as u32;
+                enc.set_compute_pipeline_state(&self.dif_r16_ps);
+                enc.set_buffer(0, Some(data), 0);
+                enc.set_buffer(1, Some(twiddles), 0);
+                set_u32(enc, 2, height);
+                set_u32(enc, 3, width);
+                set_u32(enc, 4, dif_stage);
+                enc.dispatch_threads(
+                    MTLSize { width: width as u64, height: num_units as u64, depth: 1 },
+                    MTLSize {
+                        width: tg_w as u64,
+                        height: (max_tg / tg_w).min(num_units) as u64,
+                        depth: 1,
+                    },
+                );
+                dif_stage += 4;
+            } else if gap >= 3 {
+                let num_units = height >> 3;
+                let max_tg = self.dif_r8_ps.max_total_threads_per_threadgroup() as u32;
+                enc.set_compute_pipeline_state(&self.dif_r8_ps);
+                enc.set_buffer(0, Some(data), 0);
+                enc.set_buffer(1, Some(twiddles), 0);
+                set_u32(enc, 2, height);
+                set_u32(enc, 3, width);
+                set_u32(enc, 4, dif_stage);
+                enc.dispatch_threads(
+                    MTLSize { width: width as u64, height: num_units as u64, depth: 1 },
+                    MTLSize {
+                        width: tg_w as u64,
+                        height: (max_tg / tg_w).min(num_units) as u64,
+                        depth: 1,
+                    },
+                );
+                dif_stage += 3;
+            } else if gap == 2 {
+                let num_units = height >> 2;
+                let max_tg = self.dif_r4_ps.max_total_threads_per_threadgroup() as u32;
+                enc.set_compute_pipeline_state(&self.dif_r4_ps);
+                enc.set_buffer(0, Some(data), 0);
+                enc.set_buffer(1, Some(twiddles), 0);
+                set_u32(enc, 2, height);
+                set_u32(enc, 3, width);
+                set_u32(enc, 4, dif_stage);
+                enc.dispatch_threads(
+                    MTLSize { width: width as u64, height: num_units as u64, depth: 1 },
+                    MTLSize {
+                        width: tg_w as u64,
+                        height: (max_tg / tg_w).min(num_units) as u64,
+                        depth: 1,
+                    },
+                );
+                dif_stage += 2;
+            } else {
+                let num_butterflies = height >> 1;
+                let max_tg = self.dif_r2_ps.max_total_threads_per_threadgroup() as u32;
+                enc.set_compute_pipeline_state(&self.dif_r2_ps);
+                enc.set_buffer(0, Some(data), 0);
+                enc.set_buffer(1, Some(twiddles), 0);
+                set_u32(enc, 2, height);
+                set_u32(enc, 3, width);
+                set_u32(enc, 4, dif_stage);
+                enc.dispatch_threads(
+                    MTLSize { width: width as u64, height: num_butterflies as u64, depth: 1 },
+                    MTLSize {
+                        width: tg_w as u64,
+                        height: (max_tg / tg_w).min(num_butterflies) as u64,
+                        depth: 1,
+                    },
+                );
+                dif_stage += 1;
+            }
+        }
+
+        debug_assert_eq!(dif_stage, final_dif_stage);
+
+        // Final fused-bitrev dispatch (out-of-place: data → dst).
+        match final_stages {
+            4 => {
+                let num_units = height >> 4;
+                let max_tg = self.dif_r16_bitrev_ps.max_total_threads_per_threadgroup() as u32;
+                enc.set_compute_pipeline_state(&self.dif_r16_bitrev_ps);
+                enc.set_buffer(0, Some(data), 0);
+                enc.set_buffer(1, Some(dst), 0);
+                enc.set_buffer(2, Some(twiddles), 0);
+                set_u32(enc, 3, height);
+                set_u32(enc, 4, width);
+                set_u32(enc, 5, dif_stage);
+                set_u32(enc, 6, log_n);
+                enc.dispatch_threads(
+                    MTLSize { width: width as u64, height: num_units as u64, depth: 1 },
+                    MTLSize {
+                        width: tg_w as u64,
+                        height: (max_tg / tg_w).min(num_units) as u64,
+                        depth: 1,
+                    },
+                );
+            }
+            3 => {
+                let num_units = height >> 3;
+                let max_tg = self.dif_r8_bitrev_ps.max_total_threads_per_threadgroup() as u32;
+                enc.set_compute_pipeline_state(&self.dif_r8_bitrev_ps);
+                enc.set_buffer(0, Some(data), 0);
+                enc.set_buffer(1, Some(dst), 0);
+                enc.set_buffer(2, Some(twiddles), 0);
+                set_u32(enc, 3, height);
+                set_u32(enc, 4, width);
+                set_u32(enc, 5, dif_stage);
+                set_u32(enc, 6, log_n);
+                enc.dispatch_threads(
+                    MTLSize { width: width as u64, height: num_units as u64, depth: 1 },
+                    MTLSize {
+                        width: tg_w as u64,
+                        height: (max_tg / tg_w).min(num_units) as u64,
+                        depth: 1,
+                    },
+                );
+            }
+            2 => {
+                let num_units = height >> 2;
+                let max_tg = self.dif_r4_bitrev_ps.max_total_threads_per_threadgroup() as u32;
+                enc.set_compute_pipeline_state(&self.dif_r4_bitrev_ps);
+                enc.set_buffer(0, Some(data), 0);
+                enc.set_buffer(1, Some(dst), 0);
+                enc.set_buffer(2, Some(twiddles), 0);
+                set_u32(enc, 3, height);
+                set_u32(enc, 4, width);
+                set_u32(enc, 5, dif_stage);
+                set_u32(enc, 6, log_n);
+                enc.dispatch_threads(
+                    MTLSize { width: width as u64, height: num_units as u64, depth: 1 },
+                    MTLSize {
+                        width: tg_w as u64,
+                        height: (max_tg / tg_w).min(num_units) as u64,
+                        depth: 1,
+                    },
+                );
+            }
+            1 => {
+                let num_butterflies = height >> 1;
+                let max_tg = self.dif_r2_bitrev_ps.max_total_threads_per_threadgroup() as u32;
+                enc.set_compute_pipeline_state(&self.dif_r2_bitrev_ps);
+                enc.set_buffer(0, Some(data), 0);
+                enc.set_buffer(1, Some(dst), 0);
+                enc.set_buffer(2, Some(twiddles), 0);
+                set_u32(enc, 3, height);
+                set_u32(enc, 4, width);
+                set_u32(enc, 5, dif_stage);
+                set_u32(enc, 6, log_n);
+                enc.dispatch_threads(
+                    MTLSize { width: width as u64, height: num_butterflies as u64, depth: 1 },
+                    MTLSize {
+                        width: tg_w as u64,
+                        height: (max_tg / tg_w).min(num_butterflies) as u64,
+                        depth: 1,
+                    },
+                );
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    /// DIF NTT with zero-copy roundtrip: first R16 dispatch reads from
+    /// `zc_buf` and writes to `data` (out-of-place). Remaining stages
+    /// run in-place on `data` (fast managed memory). Final bitrev gather
+    /// writes back to `zc_buf` with coalesced sequential writes.
+    fn encode_dif_ntt_zc(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        zc_buf: &metal::BufferRef,
+        data: &metal::BufferRef,
+        _dst_unused: &metal::BufferRef,
+        twiddles: &metal::BufferRef,
+        log_n: u32,
+        height: u32,
+        width: u32,
+    ) {
+        let set_u32 = |enc: &ComputeCommandEncoderRef, index: u64, val: u32| {
+            enc.set_bytes(index, size_of::<u32>() as u64, (&val as *const u32).cast());
+        };
+        let tg_w = width.min(32);
+
+        let mut dif_stage = 0u32;
+        let mut first_dispatch = true;
+
+        // All DIF stages: first out-of-place (zc→managed), rest in-place on managed.
+        while dif_stage < log_n {
+            let gap = log_n - dif_stage;
+            if gap >= 4 {
+                let num_units = height >> 4;
+                if first_dispatch {
+                    let max_tg = self.dif_r16_oop_ps.max_total_threads_per_threadgroup() as u32;
+                    enc.set_compute_pipeline_state(&self.dif_r16_oop_ps);
+                    enc.set_buffer(0, Some(zc_buf), 0);
+                    enc.set_buffer(1, Some(data), 0);
+                    enc.set_buffer(2, Some(twiddles), 0);
+                    set_u32(enc, 3, height);
+                    set_u32(enc, 4, width);
+                    set_u32(enc, 5, dif_stage);
+                    enc.dispatch_threads(
+                        MTLSize { width: width as u64, height: num_units as u64, depth: 1 },
+                        MTLSize {
+                            width: tg_w as u64,
+                            height: (max_tg / tg_w).min(num_units) as u64,
+                            depth: 1,
+                        },
+                    );
+                    first_dispatch = false;
+                } else {
+                    let max_tg = self.dif_r16_ps.max_total_threads_per_threadgroup() as u32;
+                    enc.set_compute_pipeline_state(&self.dif_r16_ps);
+                    enc.set_buffer(0, Some(data), 0);
+                    enc.set_buffer(1, Some(twiddles), 0);
+                    set_u32(enc, 2, height);
+                    set_u32(enc, 3, width);
+                    set_u32(enc, 4, dif_stage);
+                    enc.dispatch_threads(
+                        MTLSize { width: width as u64, height: num_units as u64, depth: 1 },
+                        MTLSize {
+                            width: tg_w as u64,
+                            height: (max_tg / tg_w).min(num_units) as u64,
+                            depth: 1,
+                        },
+                    );
+                }
+                dif_stage += 4;
+            } else if gap >= 3 {
+                let num_units = height >> 3;
+                let max_tg = self.dif_r8_ps.max_total_threads_per_threadgroup() as u32;
+                enc.set_compute_pipeline_state(&self.dif_r8_ps);
+                enc.set_buffer(0, Some(data), 0);
+                enc.set_buffer(1, Some(twiddles), 0);
+                set_u32(enc, 2, height);
+                set_u32(enc, 3, width);
+                set_u32(enc, 4, dif_stage);
+                enc.dispatch_threads(
+                    MTLSize { width: width as u64, height: num_units as u64, depth: 1 },
+                    MTLSize {
+                        width: tg_w as u64,
+                        height: (max_tg / tg_w).min(num_units) as u64,
+                        depth: 1,
+                    },
+                );
+                dif_stage += 3;
+            } else if gap == 2 {
+                let num_units = height >> 2;
+                let max_tg = self.dif_r4_ps.max_total_threads_per_threadgroup() as u32;
+                enc.set_compute_pipeline_state(&self.dif_r4_ps);
+                enc.set_buffer(0, Some(data), 0);
+                enc.set_buffer(1, Some(twiddles), 0);
+                set_u32(enc, 2, height);
+                set_u32(enc, 3, width);
+                set_u32(enc, 4, dif_stage);
+                enc.dispatch_threads(
+                    MTLSize { width: width as u64, height: num_units as u64, depth: 1 },
+                    MTLSize {
+                        width: tg_w as u64,
+                        height: (max_tg / tg_w).min(num_units) as u64,
+                        depth: 1,
+                    },
+                );
+                dif_stage += 2;
+            } else {
+                let num_butterflies = height >> 1;
+                let max_tg = self.dif_r2_ps.max_total_threads_per_threadgroup() as u32;
+                enc.set_compute_pipeline_state(&self.dif_r2_ps);
+                enc.set_buffer(0, Some(data), 0);
+                enc.set_buffer(1, Some(twiddles), 0);
+                set_u32(enc, 2, height);
+                set_u32(enc, 3, width);
+                set_u32(enc, 4, dif_stage);
+                enc.dispatch_threads(
+                    MTLSize { width: width as u64, height: num_butterflies as u64, depth: 1 },
+                    MTLSize {
+                        width: tg_w as u64,
+                        height: (max_tg / tg_w).min(num_butterflies) as u64,
+                        depth: 1,
+                    },
+                );
+                dif_stage += 1;
+            }
+        }
+
+        // Bitrev gather: data[bitrev(row)] → zc_buf[row] (coalesced writes
+        // to zero-copy memory; random reads from GPU-cached managed data).
+        enc.set_compute_pipeline_state(&self.bitrev_gather_ps);
+        enc.set_buffer(0, Some(data), 0);
+        enc.set_buffer(1, Some(zc_buf), 0);
+        set_u32(enc, 2, height);
+        set_u32(enc, 3, width);
+        set_u32(enc, 4, log_n);
+        {
+            let max_tg = self.bitrev_gather_ps.max_total_threads_per_threadgroup() as u32;
+            enc.dispatch_threads(
+                MTLSize { width: width as u64, height: height as u64, depth: 1 },
+                MTLSize {
+                    width: tg_w as u64,
+                    height: (max_tg / tg_w).min(height) as u64,
+                    depth: 1,
+                },
+            );
+        }
+    }
+
+    /// DIF NTT with all stages in-place on `data`, then bitrev gather copy
+    /// from `data` to `output`. Reads from `data` are random (bitrev pattern,
+    /// but cached in GPU memory); writes to `output` are sequential/coalesced.
+    fn encode_dif_ntt_gather(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        data: &metal::BufferRef,
+        output: &metal::BufferRef,
+        twiddles: &metal::BufferRef,
+        log_n: u32,
+        height: u32,
+        width: u32,
+    ) {
+        let set_u32 = |enc: &ComputeCommandEncoderRef, index: u64, val: u32| {
+            enc.set_bytes(index, size_of::<u32>() as u64, (&val as *const u32).cast());
+        };
+        let tg_w = width.min(32);
+
+        // All DIF stages in-place on `data` (no bitrev fusion).
+        let mut dif_stage = 0u32;
+        while dif_stage < log_n {
+            let gap = log_n - dif_stage;
+            if gap >= 4 {
+                let num_units = height >> 4;
+                let max_tg = self.dif_r16_ps.max_total_threads_per_threadgroup() as u32;
+                enc.set_compute_pipeline_state(&self.dif_r16_ps);
+                enc.set_buffer(0, Some(data), 0);
+                enc.set_buffer(1, Some(twiddles), 0);
+                set_u32(enc, 2, height);
+                set_u32(enc, 3, width);
+                set_u32(enc, 4, dif_stage);
+                enc.dispatch_threads(
+                    MTLSize { width: width as u64, height: num_units as u64, depth: 1 },
+                    MTLSize {
+                        width: tg_w as u64,
+                        height: (max_tg / tg_w).min(num_units) as u64,
+                        depth: 1,
+                    },
+                );
+                dif_stage += 4;
+            } else if gap >= 3 {
+                let num_units = height >> 3;
+                let max_tg = self.dif_r8_ps.max_total_threads_per_threadgroup() as u32;
+                enc.set_compute_pipeline_state(&self.dif_r8_ps);
+                enc.set_buffer(0, Some(data), 0);
+                enc.set_buffer(1, Some(twiddles), 0);
+                set_u32(enc, 2, height);
+                set_u32(enc, 3, width);
+                set_u32(enc, 4, dif_stage);
+                enc.dispatch_threads(
+                    MTLSize { width: width as u64, height: num_units as u64, depth: 1 },
+                    MTLSize {
+                        width: tg_w as u64,
+                        height: (max_tg / tg_w).min(num_units) as u64,
+                        depth: 1,
+                    },
+                );
+                dif_stage += 3;
+            } else if gap == 2 {
+                let num_units = height >> 2;
+                let max_tg = self.dif_r4_ps.max_total_threads_per_threadgroup() as u32;
+                enc.set_compute_pipeline_state(&self.dif_r4_ps);
+                enc.set_buffer(0, Some(data), 0);
+                enc.set_buffer(1, Some(twiddles), 0);
+                set_u32(enc, 2, height);
+                set_u32(enc, 3, width);
+                set_u32(enc, 4, dif_stage);
+                enc.dispatch_threads(
+                    MTLSize { width: width as u64, height: num_units as u64, depth: 1 },
+                    MTLSize {
+                        width: tg_w as u64,
+                        height: (max_tg / tg_w).min(num_units) as u64,
+                        depth: 1,
+                    },
+                );
+                dif_stage += 2;
+            } else {
+                let num_butterflies = height >> 1;
+                let max_tg = self.dif_r2_ps.max_total_threads_per_threadgroup() as u32;
+                enc.set_compute_pipeline_state(&self.dif_r2_ps);
+                enc.set_buffer(0, Some(data), 0);
+                enc.set_buffer(1, Some(twiddles), 0);
+                set_u32(enc, 2, height);
+                set_u32(enc, 3, width);
+                set_u32(enc, 4, dif_stage);
+                enc.dispatch_threads(
+                    MTLSize { width: width as u64, height: num_butterflies as u64, depth: 1 },
+                    MTLSize {
+                        width: tg_w as u64,
+                        height: (max_tg / tg_w).min(num_butterflies) as u64,
+                        depth: 1,
+                    },
+                );
+                dif_stage += 1;
+            }
+        }
+
+        // Bitrev gather: data[bitrev(row)] → output[row] (coalesced writes).
+        enc.set_compute_pipeline_state(&self.bitrev_gather_ps);
+        enc.set_buffer(0, Some(data), 0);
+        enc.set_buffer(1, Some(output), 0);
+        set_u32(enc, 2, height);
+        set_u32(enc, 3, width);
+        set_u32(enc, 4, log_n);
+        {
+            let max_tg = self.bitrev_gather_ps.max_total_threads_per_threadgroup() as u32;
+            enc.dispatch_threads(
+                MTLSize { width: width as u64, height: height as u64, depth: 1 },
+                MTLSize {
+                    width: tg_w as u64,
+                    height: (max_tg / tg_w).min(height) as u64,
+                    depth: 1,
+                },
+            );
+        }
+    }
+
+    /// Classic NTT: bitrev → shared-mem DIT stages → global R8/R4/R2.
+    ///
+    /// On Apple GPUs, dispatches within a single compute command encoder
+    /// are ordered automatically — explicit memory barriers are not needed.
+    fn encode_classic_ntt(
         &self,
         enc: &ComputeCommandEncoderRef,
         data: &metal::BufferRef,
@@ -206,14 +1374,12 @@ impl MetalBabyBearDft {
         width: u32,
     ) {
         let log_block = self.effective_log_block(log_n);
-        let block_size = 1u32 << log_block;
 
-        // Helper: push a u32 constant at `index`.
         let set_u32 = |enc: &ComputeCommandEncoderRef, index: u64, val: u32| {
             enc.set_bytes(index, size_of::<u32>() as u64, (&val as *const u32).cast());
         };
 
-        // ── Step 1: bit-reverse permutation (2D: x=col, y=row) ──
+        // ── Step 1: bit-reverse permutation ──
         enc.set_compute_pipeline_state(&self.bitrev_ps);
         enc.set_buffer(0, Some(data), 0);
         set_u32(enc, 1, height);
@@ -231,38 +1397,17 @@ impl MetalBabyBearDft {
             enc.dispatch_threads(grid, tg);
         }
 
-        // ── Step 2 (Phase B): fused stages in shared memory ──
-        {
-            let res: &metal::ResourceRef = data.deref();
-            enc.memory_barrier_with_resources(&[res]);
+        // ── Step 2: fused stages in shared memory (DIT, already bit-reversed) ──
+        self.dispatch_shared_mem(enc, data, twiddles, height, width, log_block, 0);
 
-            enc.set_compute_pipeline_state(&self.shared_mem_ps);
-            enc.set_buffer(0, Some(data), 0);
-            enc.set_buffer(1, Some(twiddles), 0);
-            set_u32(enc, 2, height);
-            set_u32(enc, 3, width);
-            set_u32(enc, 4, log_block);
-
-            let num_blocks = height / block_size;
-            enc.dispatch_thread_groups(
-                MTLSize { width: num_blocks as u64, height: 1, depth: 1 },
-                MTLSize { width: block_size as u64, height: 1, depth: 1 },
-            );
-        }
-
-        // ── Step 3 (Phase A): remaining global-memory butterfly stages ──
-        // Use the largest radix first to minimise dispatches:
-        //   remaining = 3·n_r8 + leftover  where leftover ∈ {0,1,2}
-        //   leftover 2 → 1 R4 dispatch,  leftover 1 → 1 R2 dispatch.
+        // ── Step 3: remaining global-memory butterfly stages (R8 > R4 > R2) ──
         if log_block < log_n {
             let remaining = log_n - log_block;
             let num_r8 = remaining / 3;
             let leftover = remaining % 3;
-            let res: &metal::ResourceRef = data.deref();
             let tg_w = width.min(32);
             let mut stage = log_block;
 
-            // Radix-8 dispatches (3 stages each).
             if num_r8 > 0 {
                 let num_units = height >> 3;
                 let max_tg = self.butterfly_r8_ps.max_total_threads_per_threadgroup() as u32;
@@ -272,7 +1417,6 @@ impl MetalBabyBearDft {
                 set_u32(enc, 2, height);
                 set_u32(enc, 3, width);
                 for _ in 0..num_r8 {
-                    enc.memory_barrier_with_resources(&[res]);
                     set_u32(enc, 4, stage);
                     enc.dispatch_threads(
                         MTLSize { width: width as u64, height: num_units as u64, depth: 1 },
@@ -286,11 +1430,9 @@ impl MetalBabyBearDft {
                 }
             }
 
-            // Leftover 2 → one radix-4 dispatch.
             if leftover == 2 {
                 let num_units = height >> 2;
                 let max_tg = self.butterfly_r4_ps.max_total_threads_per_threadgroup() as u32;
-                enc.memory_barrier_with_resources(&[res]);
                 enc.set_compute_pipeline_state(&self.butterfly_r4_ps);
                 enc.set_buffer(0, Some(data), 0);
                 enc.set_buffer(1, Some(twiddles), 0);
@@ -308,11 +1450,9 @@ impl MetalBabyBearDft {
                 stage += 2;
             }
 
-            // Leftover 1 → one radix-2 dispatch.
             if leftover == 1 {
                 let num_butterflies = height >> 1;
                 let max_tg = self.butterfly_ps.max_total_threads_per_threadgroup() as u32;
-                enc.memory_barrier_with_resources(&[res]);
                 enc.set_compute_pipeline_state(&self.butterfly_ps);
                 enc.set_buffer(0, Some(data), 0);
                 enc.set_buffer(1, Some(twiddles), 0);
@@ -333,14 +1473,46 @@ impl MetalBabyBearDft {
             debug_assert_eq!(stage, log_n);
         }
     }
+
+    /// Extract `col_count` columns starting at `col_start` from a row-major matrix.
+    fn extract_columns(
+        values: &[BabyBear], height: usize, full_width: usize,
+        col_start: usize, col_count: usize,
+    ) -> Vec<BabyBear> {
+        let mut out = vec![BabyBear::ZERO; height * col_count];
+        out.par_chunks_mut(col_count)
+            .enumerate()
+            .for_each(|(r, dst)| {
+                let base = r * full_width + col_start;
+                dst.copy_from_slice(&values[base..base + col_count]);
+            });
+        out
+    }
+
+    /// Merge two column groups back into a full-width row-major matrix.
+    fn merge_columns(
+        values: &mut [BabyBear],
+        left: &[BabyBear], right: &[BabyBear],
+        height: usize, full_width: usize,
+        left_width: usize, right_width: usize,
+    ) {
+        values.par_chunks_mut(full_width)
+            .enumerate()
+            .for_each(|(r, row)| {
+                row[..left_width].copy_from_slice(&left[r * left_width..(r + 1) * left_width]);
+                row[left_width..].copy_from_slice(&right[r * right_width..(r + 1) * right_width]);
+            });
+    }
 }
 
 impl TwoAdicSubgroupDft<BabyBear> for MetalBabyBearDft {
     type Evaluations = RowMajorMatrix<BabyBear>;
 
-    fn dft_batch(&self, mat: RowMajorMatrix<BabyBear>) -> Self::Evaluations {
-        if let Some(result) = self.try_gpu_dft_batch(&mat) {
-            return result;
+    fn dft_batch(&self, mut mat: RowMajorMatrix<BabyBear>) -> Self::Evaluations {
+        let height = mat.height();
+        let width = mat.width();
+        if self.try_gpu_dft_inplace(&mut mat.values, height, width).is_some() {
+            return mat;
         }
         self.cpu.dft_batch(mat)
     }
@@ -355,14 +1527,153 @@ impl TwoAdicSubgroupDft<BabyBear> for MetalBabyBearDft {
         added_bits: usize,
         shift: BabyBear,
     ) -> Self::Evaluations {
-        let coeffs = self.idft_batch(mat);
-        let h = coeffs.height();
-        let w = coeffs.width();
-        let new_h = h << added_bits;
-        let mut padded_values = coeffs.values;
-        padded_values.resize(new_h * w, <BabyBear as PrimeCharacteristicRing>::ZERO);
-        let padded = RowMajorMatrix::new(padded_values, w);
-        self.coset_dft_batch(padded, shift)
+        // Delegate to the CPU's fused IDFT+DFT which is significantly faster
+        // than doing them as separate passes (cache-friendly, single traversal).
+        self.cpu.coset_lde_batch(mat, added_bits, shift)
+    }
+}
+
+use p3_commit::{BatchOpening, BatchOpeningRef, Mmcs};
+use p3_field::PackedValue;
+use p3_merkle_tree::MerkleTreeMmcs;
+use p3_symmetric::{CryptographicHasher, PseudoCompressionFunction};
+
+/// GPU-accelerated MMCS that uses Metal Poseidon2 for Merkle tree construction.
+/// Delegates `open_batch` and `verify_batch` to the inner `MerkleTreeMmcs`.
+pub struct GpuMmcs<P, PW, H, C, const N: usize, const DIGEST_ELEMS: usize> {
+    inner: MerkleTreeMmcs<P, PW, H, C, N, DIGEST_ELEMS>,
+    gpu: MetalBabyBearDft,
+}
+
+impl<P, PW, H, C, const N: usize, const DIGEST_ELEMS: usize> std::fmt::Debug
+    for GpuMmcs<P, PW, H, C, N, DIGEST_ELEMS>
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GpuMmcs").finish_non_exhaustive()
+    }
+}
+
+impl<P: Copy, PW: Copy, H: Clone, C: Clone, const N: usize, const DIGEST_ELEMS: usize> Clone
+    for GpuMmcs<P, PW, H, C, N, DIGEST_ELEMS>
+{
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            gpu: self.gpu.clone(),
+        }
+    }
+}
+
+impl<P, PW, H, C, const N: usize, const DIGEST_ELEMS: usize>
+    GpuMmcs<P, PW, H, C, N, DIGEST_ELEMS>
+{
+    pub fn new(
+        inner: MerkleTreeMmcs<P, PW, H, C, N, DIGEST_ELEMS>,
+        gpu: MetalBabyBearDft,
+    ) -> Self {
+        Self { inner, gpu }
+    }
+}
+
+impl<P, PW, H, C> Mmcs<BabyBear> for GpuMmcs<P, PW, H, C, 2, 8>
+where
+    P: PackedValue<Value = BabyBear>,
+    PW: PackedValue<Value = BabyBear>,
+    H: CryptographicHasher<BabyBear, [BabyBear; 8]>
+        + CryptographicHasher<P, [PW; 8]>
+        + Sync,
+    C: PseudoCompressionFunction<[BabyBear; 8], 2>
+        + PseudoCompressionFunction<[PW; 8], 2>
+        + Sync,
+{
+    type ProverData<M> =
+        p3_merkle_tree::MerkleTree<BabyBear, BabyBear, M, 2, 8>;
+    type Commitment = p3_symmetric::MerkleCap<BabyBear, [BabyBear; 8]>;
+    type Proof = Vec<[BabyBear; 8]>;
+    type Error = p3_merkle_tree::MerkleTreeError;
+
+    fn commit<M: p3_matrix::Matrix<BabyBear>>(
+        &self,
+        inputs: Vec<M>,
+    ) -> (Self::Commitment, Self::ProverData<M>) {
+        if inputs.len() == 1 {
+            let height = inputs[0].height();
+            let width = inputs[0].width();
+            let total_bytes = height * width * size_of::<u32>();
+            if total_bytes >= 32 * 1024 * 1024 {
+                let is_contiguous = height >= 2 && {
+                    let s0 = inputs[0].row_slice(0).unwrap();
+                    let s1 = inputs[0].row_slice(1).unwrap();
+                    let p0 = (*s0).as_ptr();
+                    let p1 = (*s1).as_ptr();
+                    unsafe { p0.add(width) == p1 }
+                };
+
+                let (cap, digest_layers, arity_schedule) = if is_contiguous {
+                    let s0 = inputs[0].row_slice(0).unwrap();
+                    let ptr = (*s0).as_ptr();
+                    let total = height * width;
+                    let slice = unsafe { std::slice::from_raw_parts(ptr, total) };
+                    self.gpu.gpu_build_merkle_digests_raw(slice, height, width)
+                } else {
+                    let mut flat = vec![BabyBear::ZERO; height * width];
+                    flat.par_chunks_mut(width)
+                        .enumerate()
+                        .for_each(|(r, dst)| {
+                            for (i, v) in inputs[0].row(r).unwrap().into_iter().enumerate() {
+                                dst[i] = v;
+                            }
+                        });
+                    let rm = RowMajorMatrix::new(flat, width);
+                    self.gpu.gpu_build_merkle_digests(&rm)
+                };
+
+                let tree = p3_merkle_tree::MerkleTree::from_parts(
+                    inputs,
+                    digest_layers,
+                    arity_schedule,
+                );
+                return (cap, tree);
+            }
+        }
+        self.inner.commit(inputs)
+    }
+
+    fn commit_matrix<M: p3_matrix::Matrix<BabyBear>>(
+        &self,
+        input: M,
+    ) -> (Self::Commitment, Self::ProverData<M>) {
+        self.commit(vec![input])
+    }
+
+    fn open_batch<M: p3_matrix::Matrix<BabyBear>>(
+        &self,
+        index: usize,
+        prover_data: &Self::ProverData<M>,
+    ) -> BatchOpening<BabyBear, Self> {
+        let inner_opening = self.inner.open_batch(index, prover_data);
+        BatchOpening::new(inner_opening.opened_values, inner_opening.opening_proof)
+    }
+
+    fn get_matrices<'a, M: p3_matrix::Matrix<BabyBear>>(
+        &self,
+        prover_data: &'a Self::ProverData<M>,
+    ) -> Vec<&'a M> {
+        self.inner.get_matrices(prover_data)
+    }
+
+    fn verify_batch(
+        &self,
+        commit: &Self::Commitment,
+        dimensions: &[p3_matrix::Dimensions],
+        index: usize,
+        batch_opening: BatchOpeningRef<'_, BabyBear, Self>,
+    ) -> Result<(), Self::Error> {
+        let inner_ref = BatchOpeningRef::new(
+            batch_opening.opened_values,
+            batch_opening.opening_proof,
+        );
+        self.inner.verify_batch(commit, dimensions, index, inner_ref)
     }
 }
 
@@ -371,6 +1682,242 @@ mod tests {
     use rand::{RngExt, SeedableRng, rngs::SmallRng};
 
     use super::*;
+
+    /// Measure raw GPU memory bandwidth and per-phase NTT timings.
+    #[test]
+    fn gpu_bandwidth_and_phase_timing() {
+        for &(test_log_n, test_width) in &[(20u32, 64usize), (22, 64)] {
+            run_timing_test(test_log_n, test_width);
+        }
+    }
+
+    fn run_timing_test(log_n: u32, width: usize) {
+        let gpu = MetalBabyBearDft::default();
+        let n = 1usize << log_n;
+        let total = n * width;
+        let total_bytes = (total * 4) as u64;
+        let data_gb = total_bytes as f64 / 1e9;
+
+        let opts = MTLResourceOptions::CPUCacheModeDefaultCache
+            | MTLResourceOptions::StorageModeShared;
+        let buf_a = gpu.device.new_buffer(total_bytes, opts);
+        let buf_b = gpu.device.new_buffer(total_bytes, opts);
+        let tw = gpu.twiddle_buffer(log_n);
+
+        let bw_ps = {
+            let lib = gpu.device.new_library_with_source(SHADER_MSL, &CompileOptions::new()).unwrap();
+            let f = lib.get_function("bb_bandwidth_test", None).unwrap();
+            gpu.device.new_compute_pipeline_state_with_function(&f).unwrap()
+        };
+
+        let time_cmd = |label: &str, encode: &dyn Fn(&metal::ComputeCommandEncoderRef)| -> f64 {
+            // Warmup
+            autoreleasepool(|| {
+                let cmd = gpu.queue.new_command_buffer();
+                let enc = cmd.new_compute_command_encoder();
+                encode(&enc);
+                enc.end_encoding();
+                cmd.commit();
+                cmd.wait_until_completed();
+            });
+            // Timed runs
+            let iters = 5;
+            let start = std::time::Instant::now();
+            for _ in 0..iters {
+                autoreleasepool(|| {
+                    let cmd = gpu.queue.new_command_buffer();
+                    let enc = cmd.new_compute_command_encoder();
+                    encode(&enc);
+                    enc.end_encoding();
+                    cmd.commit();
+                    cmd.wait_until_completed();
+                });
+            }
+            let elapsed = start.elapsed().as_secs_f64() / iters as f64;
+            let bw = (2.0 * data_gb) / elapsed; // read + write
+            eprintln!("  {label:30}: {:.2} ms  ({:.1} GB/s)", elapsed * 1e3, bw);
+            elapsed
+        };
+
+        let height = n as u32;
+        let set_u32 = |enc: &metal::ComputeCommandEncoderRef, index: u64, val: u32| {
+            enc.set_bytes(index, size_of::<u32>() as u64, (&val as *const u32).cast());
+        };
+
+        eprintln!("\n=== GPU Bandwidth & Phase Timing (log_n={log_n}, width={width}, {:.2} GB) ===", data_gb);
+
+        // 1) Raw bandwidth: read + write every element
+        time_cmd("raw_bandwidth (r+w)", &|enc| {
+            enc.set_compute_pipeline_state(&bw_ps);
+            enc.set_buffer(0, Some(&buf_a), 0);
+            let max_tg = bw_ps.max_total_threads_per_threadgroup() as u64;
+            enc.dispatch_threads(
+                MTLSize { width: total as u64, height: 1, depth: 1 },
+                MTLSize { width: max_tg, height: 1, depth: 1 },
+            );
+        });
+
+        // 2) Bitrev pass
+        time_cmd("bitrev", &|enc| {
+            enc.set_compute_pipeline_state(&gpu.bitrev_ps);
+            enc.set_buffer(0, Some(&buf_a), 0);
+            set_u32(enc, 1, height);
+            set_u32(enc, 2, width as u32);
+            set_u32(enc, 3, log_n);
+            let tg_w = (width as u32).min(32);
+            let tg_h = (gpu.bitrev_ps.max_total_threads_per_threadgroup() as u32 / tg_w).min(height);
+            enc.dispatch_threads(
+                MTLSize { width: width as u64, height: height as u64, depth: 1 },
+                MTLSize { width: tg_w as u64, height: tg_h as u64, depth: 1 },
+            );
+        });
+
+        // 3) Shared-mem pass (10 stages fused)
+        let log_block = gpu.effective_log_block(log_n);
+        time_cmd(&format!("shared_mem ({log_block} stages)"), &|enc| {
+            gpu.dispatch_shared_mem(enc, &buf_a, &tw, height, width as u32, log_block, 0);
+        });
+
+        // 4) One R8 dispatch
+        time_cmd("single_R8 (3 stages)", &|enc| {
+            let tg_w = (width as u32).min(32);
+            let num_units = height >> 3;
+            let max_tg = gpu.butterfly_r8_ps.max_total_threads_per_threadgroup() as u32;
+            enc.set_compute_pipeline_state(&gpu.butterfly_r8_ps);
+            enc.set_buffer(0, Some(&buf_a), 0);
+            enc.set_buffer(1, Some(&tw), 0);
+            set_u32(enc, 2, height);
+            set_u32(enc, 3, width as u32);
+            set_u32(enc, 4, log_block); // stage = log_block
+            enc.dispatch_threads(
+                MTLSize { width: width as u64, height: num_units as u64, depth: 1 },
+                MTLSize { width: tg_w as u64, height: (max_tg / tg_w).min(num_units) as u64, depth: 1 },
+            );
+        });
+
+        // 5) Stockham radix-4 (12 stages fused)
+        let stockham_log_block = gpu.max_log_stockham_block.min(log_n);
+        time_cmd(&format!("stockham_r4 ({stockham_log_block} stages)"), &|enc| {
+            gpu.dispatch_stockham(enc, &buf_a, &tw, height, width as u32, stockham_log_block);
+        });
+
+        // 6) Full classic NTT (all phases combined)
+        time_cmd("full_classic_NTT", &|enc| {
+            gpu.encode_classic_ntt(enc, &buf_a, &tw, log_n, height, width as u32);
+        });
+
+        // 7) DIF NTT (no bitrev, no shared-mem, fused bitrev at end)
+        time_cmd("dif_ntt (fused bitrev)", &|enc| {
+            gpu.encode_dif_ntt(enc, &buf_a, &buf_b, &tw, log_n, height, width as u32);
+        });
+
+        // 8) Single DIF R8 dispatch
+        let tg_w2 = (width as u32).min(32);
+        time_cmd("single_DIF_R8 (3 stages)", &|enc| {
+            let num_units = height >> 3;
+            let max_tg = gpu.dif_r8_ps.max_total_threads_per_threadgroup() as u32;
+            enc.set_compute_pipeline_state(&gpu.dif_r8_ps);
+            enc.set_buffer(0, Some(&buf_a), 0);
+            enc.set_buffer(1, Some(&tw), 0);
+            set_u32(enc, 2, height);
+            set_u32(enc, 3, width as u32);
+            set_u32(enc, 4, 0u32);
+            enc.dispatch_threads(
+                MTLSize { width: width as u64, height: num_units as u64, depth: 1 },
+                MTLSize {
+                    width: tg_w2 as u64,
+                    height: (max_tg / tg_w2).min(num_units) as u64,
+                    depth: 1,
+                },
+            );
+        });
+
+        eprintln!("===\n");
+    }
+
+    /// Simulate the full benchmark flow with per-phase timing.
+    #[test]
+    fn gpu_full_flow_timing() {
+        let gpu = MetalBabyBearDft::default();
+        for &(log_n, width) in &[(20u32, 64usize), (22, 64)] {
+            let n = 1usize << log_n;
+            let total = n * width;
+            let total_bytes = (total * 4) as u64;
+            let data_gb = total_bytes as f64 / 1e9;
+
+            let opts = MTLResourceOptions::CPUCacheModeDefaultCache
+                | MTLResourceOptions::StorageModeShared;
+            let buf_a = gpu.device.new_buffer(total_bytes, opts);
+            let buf_b = gpu.device.new_buffer(total_bytes, opts);
+            let tw = gpu.twiddle_buffer(log_n);
+            let height = n as u32;
+
+            let iters = if log_n <= 20 { 5 } else { 2 };
+
+            // Warmup
+            autoreleasepool(|| {
+                let cmd = gpu.queue.new_command_buffer();
+                let enc = cmd.new_compute_command_encoder();
+                gpu.encode_dif_ntt(&enc, &buf_a, &buf_b, &tw, log_n, height, width as u32);
+                enc.end_encoding();
+                cmd.commit();
+                cmd.wait_until_completed();
+            });
+
+            // Pure GPU compute (no memcpy)
+            let start = std::time::Instant::now();
+            for _ in 0..iters {
+                autoreleasepool(|| {
+                    let cmd = gpu.queue.new_command_buffer();
+                    let enc = cmd.new_compute_command_encoder();
+                    gpu.encode_dif_ntt(&enc, &buf_a, &buf_b, &tw, log_n, height, width as u32);
+                    enc.end_encoding();
+                    cmd.commit();
+                    cmd.wait_until_completed();
+                });
+            }
+            let gpu_ms = start.elapsed().as_secs_f64() / iters as f64 * 1e3;
+
+            // Memcpy timing
+            let mut rng = SmallRng::seed_from_u64(42);
+            let values: Vec<BabyBear> = (0..total).map(|_| rng.random()).collect();
+            let copy_start = std::time::Instant::now();
+            for _ in 0..iters {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        values.as_ptr().cast::<u8>(),
+                        buf_a.contents() as *mut u8,
+                        total_bytes as usize,
+                    );
+                }
+            }
+            let copy_in_ms = copy_start.elapsed().as_secs_f64() / iters as f64 * 1e3;
+
+            let mut out: Vec<BabyBear> = vec![BabyBear::ZERO; total];
+            let copy_start = std::time::Instant::now();
+            for _ in 0..iters {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        buf_b.contents() as *const BabyBear,
+                        out.as_mut_ptr(),
+                        total,
+                    );
+                }
+            }
+            let copy_out_ms = copy_start.elapsed().as_secs_f64() / iters as f64 * 1e3;
+
+            // Full flow (clone + memcpy_in + gpu + memcpy_out)
+            let full_start = std::time::Instant::now();
+            for _ in 0..iters {
+                let mut v = values.clone();
+                gpu.try_gpu_dft_inplace(&mut v, n, width);
+            }
+            let full_ms = full_start.elapsed().as_secs_f64() / iters as f64 * 1e3;
+
+            eprintln!("[{log_n}x{width} ({data_gb:.2}GB)] gpu_pure={gpu_ms:.1}ms copy_in={copy_in_ms:.1}ms copy_out={copy_out_ms:.1}ms full_flow={full_ms:.1}ms overhead={:.1}ms",
+                full_ms - gpu_ms);
+        }
+    }
 
     #[test]
     fn metal_dft_matches_cpu() {
@@ -388,11 +1935,190 @@ mod tests {
                 let cpu_result =
                     cpu_dft.dft_batch(RowMajorMatrix::new(values.clone(), width));
                 let gpu_result = gpu_dft.dft_batch(RowMajorMatrix::new(values, width));
+                if cpu_result.values != gpu_result.values {
+                    let first_diff = cpu_result.values.iter().zip(&gpu_result.values)
+                        .enumerate()
+                        .find(|(_, (a, b))| a != b);
+                    if let Some((idx, (cpu_v, gpu_v))) = first_diff {
+                        eprintln!("mismatch at log_n={log_n} w={width}: idx={idx} cpu={cpu_v:?} gpu={gpu_v:?}");
+                    }
+                    panic!("mismatch at log_n={log_n}, width={width}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn metal_poseidon2_matches_cpu() {
+        use p3_baby_bear::Poseidon2BabyBear;
+        use p3_symmetric::Permutation;
+
+        let gpu = MetalBabyBearDft::default(); // uses seed 1
+
+        // Create CPU permutation with the same seed
+        let perm = Poseidon2BabyBear::<16>::new_from_rng_128(
+            &mut SmallRng::seed_from_u64(1),
+        );
+
+        let input: [BabyBear; 16] = BabyBear::new_array([
+            894848333, 1437655012, 1200606629, 1690012884, 71131202, 1749206695, 1717947831,
+            120589055, 19776022, 42382981, 1831865506, 724844064, 171220207, 1299207443, 227047920,
+            1783754913,
+        ]);
+
+        // CPU reference
+        let mut expected = input;
+        perm.permute_mut(&mut expected);
+
+        // GPU compress: input[0..8] = left, input[8..16] = right → output first 8 of permute(input)
+        let gpu_result = gpu.gpu_poseidon2_permute(&input);
+
+        for i in 0..8 {
+            assert_eq!(
+                gpu_result[i], expected[i],
+                "Poseidon2 mismatch at index {i}: gpu={:?} expected={:?}",
+                gpu_result[i], expected[i]
+            );
+        }
+        eprintln!("GPU Poseidon2 matches CPU reference (first 8 elements)!");
+    }
+
+    #[test]
+    fn metal_poseidon2_leaf_hash_matches_cpu() {
+        use p3_baby_bear::Poseidon2BabyBear;
+        use p3_symmetric::PaddingFreeSponge;
+        use p3_symmetric::CryptographicHasher;
+
+        let gpu = MetalBabyBearDft::default();
+        let mut rng = SmallRng::seed_from_u64(123);
+
+        // Create CPU hasher (same config as benchmark)
+        let perm = Poseidon2BabyBear::<16>::new_from_rng_128(&mut SmallRng::seed_from_u64(1));
+        let hasher = PaddingFreeSponge::<Poseidon2BabyBear<16>, 16, 8, 8>::new(perm);
+
+        // Test with various leaf widths
+        for leaf_width in [8, 16, 32, 64] {
+            let num_leaves = 64u32;
+            let data: Vec<BabyBear> = (0..(num_leaves as usize * leaf_width))
+                .map(|_| rng.random())
+                .collect();
+
+            // CPU hash
+            let cpu_digests: Vec<[BabyBear; 8]> = (0..num_leaves as usize)
+                .map(|i| {
+                    let row = &data[i * leaf_width..(i + 1) * leaf_width];
+                    hasher.hash_iter(row.iter().copied())
+                })
+                .collect();
+
+            // GPU hash
+            let opts = MTLResourceOptions::CPUCacheModeDefaultCache
+                | MTLResourceOptions::StorageModeShared;
+            let data_buf = gpu.device.new_buffer_with_data(
+                data.as_ptr().cast(),
+                (data.len() * size_of::<u32>()) as u64,
+                opts,
+            );
+            let layers = gpu.gpu_merkle_tree(&data_buf, num_leaves, leaf_width as u32);
+            let gpu_leaf_u32 = &layers[0];
+
+            // Compare
+            for i in 0..num_leaves as usize {
+                for j in 0..8 {
+                    let cpu_val: u32 = unsafe { std::mem::transmute(cpu_digests[i][j]) };
+                    let gpu_val = gpu_leaf_u32[i * 8 + j];
+                    assert_eq!(
+                        cpu_val, gpu_val,
+                        "Leaf hash mismatch: leaf={i} elem={j} width={leaf_width} cpu={cpu_val:#x} gpu={gpu_val:#x}"
+                    );
+                }
+            }
+            eprintln!("Leaf hash matches CPU for width={leaf_width}, {num_leaves} leaves");
+        }
+    }
+
+    #[test]
+    fn metal_dft_algebra_batch_matches_cpu() {
+        use p3_field::extension::BinomialExtensionField;
+        type EF = BinomialExtensionField<BabyBear, 4>;
+
+        let mut rng = SmallRng::seed_from_u64(99);
+        let cpu_dft = Radix2DFTSmallBatch::<BabyBear>::default();
+        let gpu_dft = MetalBabyBearDft {
+            gpu_min_log_n: 0,
+            ..MetalBabyBearDft::default()
+        };
+
+        for log_n in 2..=18 {
+            let n = 1usize << log_n;
+            for &ef_width in &[1, 4, 16] {
+                let values: Vec<EF> = (0..n * ef_width).map(|_| rng.random()).collect();
+                let cpu_result = cpu_dft.dft_algebra_batch(
+                    RowMajorMatrix::new(values.clone(), ef_width),
+                );
+                let gpu_result = gpu_dft.dft_algebra_batch(
+                    RowMajorMatrix::new(values, ef_width),
+                );
                 assert_eq!(
                     cpu_result.values, gpu_result.values,
-                    "mismatch at log_n={log_n}, width={width}"
+                    "algebra_batch mismatch at log_n={log_n}, ef_width={ef_width}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn gpu_mmcs_matches_cpu_mmcs() {
+        use p3_baby_bear::Poseidon2BabyBear;
+        use p3_commit::Mmcs;
+        use p3_merkle_tree::MerkleTreeMmcs;
+        use p3_symmetric::{PaddingFreeSponge, TruncatedPermutation};
+
+        type Perm = Poseidon2BabyBear<16>;
+        type MyHash = PaddingFreeSponge<Perm, 16, 8, 8>;
+        type MyCompress = TruncatedPermutation<Perm, 2, 8, 16>;
+        type PackedF = <BabyBear as p3_field::Field>::Packing;
+        type CpuMmcs = MerkleTreeMmcs<PackedF, PackedF, MyHash, MyCompress, 2, 8>;
+
+        let mut rng = SmallRng::seed_from_u64(1);
+        let perm = Perm::new_from_rng_128(&mut rng);
+        let hash = MyHash::new(perm.clone());
+        let compress = MyCompress::new(perm);
+        let cpu_mmcs = CpuMmcs::new(hash, compress, 0);
+
+        let gpu = MetalBabyBearDft::default();
+        let gpu_mmcs = GpuMmcs::new(cpu_mmcs.clone(), gpu);
+
+        let mut data_rng = SmallRng::seed_from_u64(42);
+
+        for (height, width) in [(64, 16), (128, 8), (256, 32)] {
+            let data: Vec<BabyBear> = (0..height * width)
+                .map(|_| data_rng.random())
+                .collect();
+
+            let (cpu_cap, cpu_data) =
+                cpu_mmcs.commit_matrix(RowMajorMatrix::new(data.clone(), width));
+            let (gpu_cap, gpu_data) =
+                gpu_mmcs.commit_matrix(RowMajorMatrix::new(data.clone(), width));
+
+            assert_eq!(
+                cpu_cap, gpu_cap,
+                "Cap mismatch for {height}x{width}"
+            );
+
+            for idx in [0, 1, height / 2, height - 1] {
+                let cpu_opening = cpu_mmcs.open_batch(idx, &cpu_data);
+                let gpu_opening = gpu_mmcs.open_batch(idx, &gpu_data);
+                assert_eq!(
+                    cpu_opening.opened_values, gpu_opening.opened_values,
+                    "Opened values mismatch at idx={idx} for {height}x{width}"
+                );
+                assert_eq!(
+                    cpu_opening.opening_proof, gpu_opening.opening_proof,
+                    "Proof mismatch at idx={idx} for {height}x{width}"
+                );
+            }
+            eprintln!("GPU MMCS matches CPU for {height}x{width}");
         }
     }
 }

@@ -45,7 +45,7 @@ rayon = { version = "1.0", optional = true }
 p3-field = { git = "https://github.com/Plonky3/Plonky3", rev = "090b134a7e4f73191dad8849c410fcc38967a814" }
 p3-baby-bear = { git = "https://github.com/Plonky3/Plonky3", rev = "090b134a7e4f73191dad8849c410fcc38967a814" }
 p3-koala-bear = { git = "https://github.com/Plonky3/Plonky3", rev = "090b134a7e4f73191dad8849c410fcc38967a814" }
-p3-merkle-tree = { git = "https://github.com/Plonky3/Plonky3", rev = "090b134a7e4f73191dad8849c410fcc38967a814" }
+p3-merkle-tree = { path = "p3-merkle-tree-patched" }
 p3-symmetric = { git = "https://github.com/Plonky3/Plonky3", rev = "090b134a7e4f73191dad8849c410fcc38967a814" }
 p3-matrix = { git = "https://github.com/Plonky3/Plonky3", rev = "090b134a7e4f73191dad8849c410fcc38967a814" }
 p3-commit = { git = "https://github.com/Plonky3/Plonky3", rev = "090b134a7e4f73191dad8849c410fcc38967a814" }
