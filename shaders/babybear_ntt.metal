@@ -1,6 +1,41 @@
-// BabyBear field + forward NTT + Poseidon2 Merkle hashing.
+// BabyBear field + forward NTT + Poseidon2 Merkle hashing + PoW grinding.
 // All kernels work on ROW-MAJOR matrices: data[row * width + col].
 // A single dispatch handles all columns — no CPU transpose needed.
+//
+// ┌─────────────────────────────┬──────┬─────────────────────────────────────────┐
+// │ Kernel                      │ Line │ Purpose                                 │
+// ├─────────────────────────────┼──────┼─────────────────────────────────────────┤
+// │ bb_bandwidth_test           │    6 │ Read-write bandwidth microbenchmark     │
+// │ bb_bitrev_gather            │   67 │ Bit-reversal permutation (gather)       │
+// │ bb_ntt_bitrev               │   86 │ Bit-reversal + twiddle (legacy)         │
+// │ bb_ntt_shared_mem           │  121 │ Shared-memory radix-2 NTT block         │
+// │ bb_ntt_shared_mem_gs        │  204 │ Shared-memory Gentleman-Sande NTT       │
+// │ bb_ntt_butterfly            │  303 │ Global radix-2 butterfly                │
+// │ bb_ntt_butterfly_r4         │  345 │ Global radix-4 butterfly                │
+// │ bb_ntt_butterfly_r8         │  418 │ Global radix-8 butterfly                │
+// │ bb_ntt_stockham             │  509 │ Stockham auto-sort NTT block            │
+// │ bb_stockham_global_r2       │  656 │ Global Stockham radix-2 pass            │
+// ├─────────────────────────────┼──────┼─────────────────────────────────────────┤
+// │ bb_dif_r8                   │  707 │ DIF radix-8 in-place stage              │
+// │ bb_dif_r4                   │  806 │ DIF radix-4 in-place stage              │
+// │ bb_dif_r2                   │  869 │ DIF radix-2 in-place stage              │
+// │ bb_dif_r16                  │  904 │ DIF radix-16 in-place stage             │
+// │ bb_dif_r16_oop              │  992 │ DIF radix-16 out-of-place (first pass)  │
+// │ bb_dif_r32                  │ 1077 │ DIF radix-32 in-place stage             │
+// │ bb_dif_r32_bitrev           │ 1180 │ DIF radix-32 + bit-reversal gather      │
+// │ bb_dif_r16_bitrev           │ 1270 │ DIF radix-16 + bit-reversal gather      │
+// │ bb_dif_r8_bitrev            │ 1368 │ DIF radix-8  + bit-reversal gather      │
+// │ bb_dif_r4_bitrev            │ 1471 │ DIF radix-4  + bit-reversal gather      │
+// │ bb_dif_r2_bitrev            │ 1536 │ DIF radix-2  + bit-reversal gather      │
+// │ bb_dif_shared_bitrev        │ 1652 │ Shared-memory DIF + bitrev (small n)    │
+// ├─────────────────────────────┼──────┼─────────────────────────────────────────┤
+// │ bb_transpose                │ 1578 │ Matrix transpose                        │
+// │ bb_ntt_twiddle_transpose    │ 1602 │ Twiddle multiply + transpose            │
+// ├─────────────────────────────┼──────┼─────────────────────────────────────────┤
+// │ poseidon2_hash_leaves       │ 1838 │ Poseidon2 sponge over leaf rows         │
+// │ poseidon2_merkle_compress   │ 1870 │ Poseidon2 2-to-1 Merkle compression     │
+// │ poseidon2_pow_grind         │ 1913 │ Parallel PoW nonce search               │
+// └─────────────────────────────┴──────┴─────────────────────────────────────────┘
 
 // Simple read-write bandwidth test: data[i] += 1 for every element.
 kernel void bb_bandwidth_test(
