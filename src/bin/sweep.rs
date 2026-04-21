@@ -47,7 +47,7 @@ fn run_cpu(n: usize, f: usize, r: usize) -> Option<f64> {
             mmcs,
             soundness_type: SecurityAssumption::CapacityBound,
             starting_log_inv_rate: r,
-            rs_domain_initial_reduction_factor: 3,
+            rs_domain_initial_reduction_factor: f.min(3),
         };
         let params = WhirConfig::new(n, whir_params.clone());
         let max_fft = 1 << params.max_fft_size();
@@ -115,7 +115,7 @@ fn run_gpu_inner(n: usize, f: usize, r: usize, fuse_rounds: bool, gpu_grind: boo
             mmcs: inner.clone(),
             soundness_type: SecurityAssumption::CapacityBound,
             starting_log_inv_rate: r,
-            rs_domain_initial_reduction_factor: 3,
+            rs_domain_initial_reduction_factor: f.min(3),
         };
         let params_cpu = WhirConfig::<EF, F, MyMmcs, MyChallenger>::new(n, whir_params_cpu);
         let max_fft = 1 << params_cpu.max_fft_size();
@@ -131,7 +131,7 @@ fn run_gpu_inner(n: usize, f: usize, r: usize, fuse_rounds: bool, gpu_grind: boo
                 mmcs,
                 soundness_type: SecurityAssumption::CapacityBound,
                 starting_log_inv_rate: r,
-                rs_domain_initial_reduction_factor: 3,
+                rs_domain_initial_reduction_factor: f.min(3),
             };
             let params = WhirConfig::<EF, F, MyGpuMmcs, GpuChallenger>::new(n, whir_params.clone());
 
@@ -178,7 +178,7 @@ fn run_gpu_inner(n: usize, f: usize, r: usize, fuse_rounds: bool, gpu_grind: boo
                 mmcs,
                 soundness_type: SecurityAssumption::CapacityBound,
                 starting_log_inv_rate: r,
-                rs_domain_initial_reduction_factor: 3,
+                rs_domain_initial_reduction_factor: f.min(3),
             };
             let params = WhirConfig::new(n, whir_params.clone());
 
@@ -285,7 +285,7 @@ fn main() {
     }
 
     let mut configs: Vec<(usize, usize, usize)> = Vec::new();
-    let folds = &[4, 6, 8];
+    let folds = &[1, 2, 3, 4, 6, 8];
     let rates = &[1, 2, 3];
     for &n in &[18, 20, 22, 24] {
         for &f in folds {
