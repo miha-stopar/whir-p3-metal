@@ -50,7 +50,7 @@ implements. The fusion is used in two places:
 2. **Per-round commits** — `Prover::prove_fused()` fuses the extension-field
    DFT (`dft_algebra_batch`) + Merkle for every STIR round that has a large
    enough matrix. Falls back to separate DFT + commit when the matrix is
-   below the GPU threshold (64 MB).
+   below the GPU threshold (8 MB).
 
 The fused pipeline for a single commit:
 
@@ -79,51 +79,79 @@ mapping efficiently to Apple GPU's ALU.
 
 ### Benchmarks
 
-All benchmarks on Apple M-series silicon (unified memory). Parameters:
+All benchmarks on Apple M-series silicon (unified memory). Best of 3 runs
+(median). Parameters:
 - `n` = `num_variables` (polynomial has 2^n coefficients)
 - `fold` = `folding_factor` (each STIR round folds 2^fold evaluations)
 - `rate` = `starting_log_inv_rate` (RS code rate = 1/2^rate, domain = 2^(n+rate) points)
 - **GPU** = fused initial commit only (rounds use separate DFT + commit)
 - **Fused** = fused initial commit + fused per-round DFT+Merkle (`prove_fused`)
-- Speedup = CPU time / GPU or Fused time
 
-#### Parameter sweep — n=22 (4M coefficients)
+#### n=18 (256K coefficients)
 
-| fold | rate | CPU (ms) | GPU (ms) | Fused (ms) | GPU speedup | Fused speedup |
-|------|------|----------|----------|------------|-------------|---------------|
-| 4 | 1 | 184 | 155 | 139 | **1.19x** | **1.32x** |
-| 4 | 2 | 342 | 254 | 238 | **1.35x** | **1.44x** |
-| 4 | 3 | 856 | 673 | 765 | **1.27x** | 1.12x |
-| 6 | 1 | 154 | 142 | 174 | 1.08x | 0.89x |
-| 6 | 2 | 414 | 498 | 346 | 0.83x | **1.20x** |
-| **8** | **1** | **126** | **70** | **79** | **1.80x** | **1.59x** |
-| 8 | 2 | 184 | 158 | 156 | **1.17x** | **1.18x** |
-| 8 | 3 | 436 | 369 | 326 | 1.18x | **1.34x** |
+| fold | rate | CPU (ms) | GPU (ms) | Fused (ms) | GPU | Fused |
+|------|------|----------|----------|------------|-----|-------|
+| 4 | 1 | 15 | 20 | 23 | 0.77x | 0.66x |
+| 4 | 2 | 31 | 34 | 31 | 0.90x | 0.97x |
+| 4 | 3 | 36 | 42 | 48 | 0.85x | 0.75x |
+| 6 | 1 | 10 | 21 | 17 | 0.48x | 0.61x |
+| 6 | 2 | 18 | 19 | 23 | 0.94x | 0.79x |
+| 6 | 3 | 24 | 28 | 34 | 0.88x | 0.71x |
+| 8 | 1 | 12 | 16 | 16 | 0.77x | 0.74x |
+| 8 | 2 | 16 | 21 | 26 | 0.78x | 0.62x |
+| 8 | 3 | 29 | 36 | 40 | 0.81x | 0.74x |
 
-#### Parameter sweep — n=24 (16M coefficients)
+> GPU overhead dominates at this size. All configs slower than CPU.
 
-| fold | rate | CPU (ms) | GPU (ms) | Fused (ms) | GPU speedup | Fused speedup |
-|------|------|----------|----------|------------|-------------|---------------|
-| **4** | **1** | **1097** | **955** | **700** | **1.15x** | **1.57x** |
-| **6** | **1** | **590** | **527** | **391** | **1.12x** | **1.51x** |
+#### n=20 (1M coefficients)
 
-#### Observations
+| fold | rate | CPU (ms) | GPU (ms) | Fused (ms) | GPU | Fused |
+|------|------|----------|----------|------------|-----|-------|
+| 4 | 1 | 53 | 55 | 59 | 0.97x | 0.90x |
+| 4 | 2 | 87 | 92 | 78 | 0.94x | **1.11x** |
+| 4 | 3 | 186 | 196 | 143 | 0.95x | **1.30x** |
+| 6 | 1 | 47 | 49 | 50 | 0.96x | 0.93x |
+| 6 | 2 | 114 | 92 | 108 | **1.23x** | 1.05x |
+| 6 | 3 | 611 | 439 | 516 | **1.39x** | **1.18x** |
+| 8 | 1 | 26 | 32 | 34 | 0.83x | 0.78x |
+| 8 | 2 | 52 | 45 | 48 | **1.16x** | 1.08x |
+| 8 | 3 | 100 | 86 | 83 | **1.16x** | **1.20x** |
 
-- **Best GPU speedup: n=22, fold=8, rate=1 at 1.80x.** Lowering the GPU
-  dispatch threshold from 64 MB to 8 MB allowed per-round DFT matrices
-  (previously just below the cutoff) to run on GPU, dramatically improving
-  this config from break-even to nearly 2x.
-- **Round fusion + low threshold: n=24, fold=4, rate=1 at 1.57x.** The
-  fused round path (`prove_fused`) adds 0.2–0.4x over commit-only fusion
-  on larger polynomials.
-- **Zero-copy bitrev gather** eliminates the post-GPU full-matrix memcpy.
-  On Apple Silicon unified memory, the bitrev gather writes directly into
-  the caller's Vec and Merkle hashing reads from the same buffer.
-- **GPU loses at very small data (<8 MB)** — the pipeline automatically
-  falls back to CPU.
-- **Folding factors ≥ 10 on GPU** are unstable on some Apple Silicon
-  configurations (Metal driver crashes).
-- GPU domain size is capped at 2^25 to avoid Metal driver crashes.
+> GPU starts winning at rate=2-3. Crossover around 50-100 ms CPU time.
+
+#### n=22 (4M coefficients)
+
+| fold | rate | CPU (ms) | GPU (ms) | Fused (ms) | GPU | Fused |
+|------|------|----------|----------|------------|-----|-------|
+| 4 | 1 | 192 | 153 | 132 | **1.26x** | **1.45x** |
+| 4 | 2 | 354 | 256 | 232 | **1.38x** | **1.53x** |
+| 4 | 3 | 780 | 656 | 687 | **1.19x** | **1.13x** |
+| 6 | 1 | 168 | fail | 134 | - | **1.25x** |
+| **6** | **2** | **678** | **424** | **361** | **1.60x** | **1.88x** |
+| 6 | 3 | 2575 | 1767 | 2381 | **1.46x** | 1.08x |
+| 8 | 1 | 95 | 71 | 73 | **1.34x** | **1.30x** |
+| 8 | 2 | 193 | 182 | 161 | 1.06x | **1.19x** |
+| 8 | 3 | 465 | 344 | 321 | **1.35x** | **1.45x** |
+
+> Best result: **1.88x** at fold=6, rate=2.
+
+#### n=24 (16M coefficients)
+
+| fold | rate | CPU (ms) | GPU (ms) | Fused (ms) | GPU | Fused |
+|------|------|----------|----------|------------|-----|-------|
+| 4 | 1 | 992 | fail | 970 | - | 1.02x |
+| 6 | 1 | 663 | 515 | 526 | **1.29x** | **1.26x** |
+
+> Limited by GPU domain cap (2^25). Higher rates/folds push domain beyond safe limit.
+
+#### Summary
+
+| n | Best speedup | Config |
+|---|-------------|--------|
+| 18 | < 1x | GPU overhead dominates |
+| 20 | **1.39x** | fold=6, rate=3 |
+| 22 | **1.88x** | fold=6, rate=2 |
+| 24 | **1.29x** | fold=6, rate=1 |
 
 #### Running benchmarks
 
@@ -135,3 +163,6 @@ cargo bench --features gpu-metal --bench dft_gpu -- "whir_prove"
 # (writes results to sweep_results.txt)
 cargo run --release --features gpu-metal --bin sweep
 ```
+
+For a detailed optimization log with diagrams showing each step, see
+[`docs/gpu-optimizations.md`](docs/gpu-optimizations.md).

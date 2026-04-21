@@ -209,19 +209,18 @@ fn main() {
     }
 
     let mut configs: Vec<(usize, usize, usize)> = Vec::new();
-    let folds = &[4, 6, 8, 10];
+    let folds = &[4, 6, 8];
     let rates = &[1, 2, 3];
-    for &n in &[22, 24] {
+    for &n in &[18, 20, 22, 24] {
         for &f in folds {
             for &r in rates {
-                if r > f { continue; }
                 configs.push((n, f, r));
             }
         }
     }
 
     let max_log_domain_gpu: usize = 25;
-    let max_cpu_secs = 15.0;
+    let max_cpu_secs = 30.0;
 
     let header = format!(
         "{:<6} {:<6} {:<6} {:>10} {:>10} {:>10} {:>8} {:>8}",
