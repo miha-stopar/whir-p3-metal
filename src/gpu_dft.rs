@@ -251,8 +251,21 @@ pub struct MetalBabyBearDft {
     // Poseidon2 Merkle hashing pipeline states
     poseidon2_hash_leaves_ps: ComputePipelineState,
     poseidon2_compress_ps: ComputePipelineState,
+    poseidon2_pow_grind_ps: ComputePipelineState,
     /// Poseidon2 round constants buffer (143 u32 values in Montgomery form).
     poseidon2_rc_buf: Buffer,
+    /// Pre-allocated buffers for PoW grinding (avoids per-call allocation).
+    pow_bufs: Mutex<PowBuffers>,
+}
+
+struct PowBuffers {
+    state_buf: Buffer,
+    params_buf: Buffer,
+    result_buf: Buffer,
+    found_buf: Buffer,
+    offset_buf: Buffer,
+    r_squared: u32,
+    tg_size: u64,
 }
 
 impl Clone for MetalBabyBearDft {
@@ -336,6 +349,22 @@ impl MetalBabyBearDft {
         let dif_shared_bitrev_ps = make_ps("bb_dif_shared_bitrev");
         let poseidon2_hash_leaves_ps = make_ps("poseidon2_hash_leaves");
         let poseidon2_compress_ps = make_ps("poseidon2_merkle_compress");
+        let poseidon2_pow_grind_ps = make_ps("poseidon2_pow_grind");
+
+        let pow_tg_size = (poseidon2_pow_grind_ps.max_total_threads_per_threadgroup() as u64)
+            .min(1024);
+        let opts_shared = MTLResourceOptions::StorageModeShared;
+        let r = (1u128 << 32) % (0x7800_0001u128);
+        let r_squared = ((r * r) % (0x7800_0001u128)) as u32;
+        let pow_bufs = PowBuffers {
+            state_buf: device.new_buffer((16 * size_of::<u32>()) as u64, opts_shared),
+            params_buf: device.new_buffer((4 * size_of::<u32>()) as u64, opts_shared),
+            result_buf: device.new_buffer(size_of::<u32>() as u64, opts_shared),
+            found_buf: device.new_buffer(size_of::<u32>() as u64, opts_shared),
+            offset_buf: device.new_buffer(size_of::<u32>() as u64, opts_shared),
+            r_squared,
+            tg_size: pow_tg_size,
+        };
 
         let p2_rc = build_poseidon2_constants(poseidon2_seed);
         let poseidon2_rc_buf = device.new_buffer_with_data(
@@ -386,8 +415,81 @@ impl MetalBabyBearDft {
             dft_result_cache: Arc::new(Mutex::new(None)),
             poseidon2_hash_leaves_ps,
             poseidon2_compress_ps,
+            poseidon2_pow_grind_ps,
             poseidon2_rc_buf,
+            pow_bufs: Mutex::new(pow_bufs),
         }
+    }
+
+    /// Brute-force search for a PoW witness on GPU using Poseidon2.
+    ///
+    /// Given the DuplexChallenger state (sponge + input buffer) and PoW difficulty,
+    /// launches a GPU kernel that tries candidates 0..P in parallel. Each thread
+    /// inserts a candidate at `witness_idx`, applies Poseidon2, and checks if
+    /// the low `pow_bits` of state\[7\] (canonical) are all zero.
+    ///
+    /// Returns `Some(canonical_witness)` on success.
+    pub fn gpu_pow_grind(
+        &self,
+        base_state_monty: &[u32; 16],
+        witness_idx: u32,
+        pow_bits: u32,
+    ) -> Option<u32> {
+        const P: u64 = 0x7800_0001;
+
+        let bufs = self.pow_bufs.lock().expect("pow_bufs mutex");
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                base_state_monty.as_ptr(),
+                bufs.state_buf.contents() as *mut u32,
+                16,
+            );
+            *(bufs.params_buf.contents() as *mut [u32; 4]) =
+                [witness_idx, pow_bits, bufs.r_squared, 0];
+            *(bufs.result_buf.contents() as *mut u32) = 0;
+            *(bufs.found_buf.contents() as *mut u32) = 0;
+        }
+
+        let batch_size: u64 = 1 << 20;
+        let tg_size = bufs.tg_size;
+
+        let mut nonce_offset: u64 = 0;
+        while nonce_offset < P {
+            let this_batch = (P - nonce_offset).min(batch_size);
+
+            unsafe { *(bufs.offset_buf.contents() as *mut u32) = nonce_offset as u32; }
+
+            let cb = self.queue.new_command_buffer();
+            let enc = cb.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&self.poseidon2_pow_grind_ps);
+            enc.set_buffer(0, Some(&bufs.state_buf), 0);
+            enc.set_buffer(1, Some(&self.poseidon2_rc_buf), 0);
+            enc.set_buffer(2, Some(&bufs.params_buf), 0);  // witness_idx
+            enc.set_buffer(3, Some(&bufs.params_buf), 4);   // pow_bits (offset 4 bytes)
+            enc.set_buffer(4, Some(&bufs.params_buf), 8);   // r_squared (offset 8 bytes)
+            enc.set_buffer(5, Some(&bufs.result_buf), 0);
+            enc.set_buffer(6, Some(&bufs.found_buf), 0);
+            enc.set_buffer(7, Some(&bufs.offset_buf), 0);
+
+            enc.dispatch_threads(
+                metal::MTLSize::new(this_batch, 1, 1),
+                metal::MTLSize::new(tg_size, 1, 1),
+            );
+            enc.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+
+            let found_val = unsafe { *(bufs.found_buf.contents() as *const u32) };
+            if found_val != 0 {
+                let winner = unsafe { *(bufs.result_buf.contents() as *const u32) };
+                return Some(winner);
+            }
+
+            nonce_offset += this_batch;
+        }
+
+        None
     }
 
     fn twiddle_buffer(&self, log_n: u32) -> Buffer {
@@ -2196,6 +2298,139 @@ where
         + PseudoCompressionFunction<[PW; 8], 2>
         + Sync,
 {}
+
+// ═══════════════════════════════════════════════════════════════════════
+// GpuChallenger: DuplexChallenger wrapper with GPU-accelerated PoW grinding
+// ═══════════════════════════════════════════════════════════════════════
+
+use p3_baby_bear::Poseidon2BabyBear;
+use p3_challenger::{
+    CanObserve, CanSample, CanSampleBits, DuplexChallenger, FieldChallenger, GrindingChallenger,
+};
+use p3_field::{ExtensionField, PrimeField64};
+use p3_symmetric::{CryptographicPermutation, Hash, MerkleCap};
+
+type InnerChallenger = DuplexChallenger<BabyBear, Poseidon2BabyBear<16>, 16, 8>;
+
+/// A `DuplexChallenger` wrapper that offloads proof-of-work grinding to GPU.
+///
+/// All other challenger operations (observe, sample, etc.) delegate to the
+/// inner `DuplexChallenger`. The `grind` call uses a Metal compute kernel
+/// that parallelizes the Poseidon2 brute-force search across GPU threads.
+#[derive(Clone)]
+pub struct GpuChallenger {
+    pub inner: InnerChallenger,
+    dft: MetalBabyBearDft,
+}
+
+impl GpuChallenger {
+    pub fn new(perm: Poseidon2BabyBear<16>, dft: MetalBabyBearDft) -> Self {
+        Self {
+            inner: InnerChallenger::new(perm),
+            dft,
+        }
+    }
+}
+
+impl CanObserve<BabyBear> for GpuChallenger {
+    fn observe(&mut self, value: BabyBear) {
+        self.inner.observe(value);
+    }
+    fn observe_slice(&mut self, values: &[BabyBear]) {
+        self.inner.observe_slice(values);
+    }
+}
+
+impl<const N: usize> CanObserve<[BabyBear; N]> for GpuChallenger {
+    fn observe(&mut self, values: [BabyBear; N]) {
+        self.inner.observe(values);
+    }
+}
+
+impl<const N: usize> CanObserve<Hash<BabyBear, BabyBear, N>> for GpuChallenger {
+    fn observe(&mut self, values: Hash<BabyBear, BabyBear, N>) {
+        self.inner.observe(values);
+    }
+}
+
+impl CanObserve<Vec<Vec<BabyBear>>> for GpuChallenger {
+    fn observe(&mut self, values: Vec<Vec<BabyBear>>) {
+        self.inner.observe(values);
+    }
+}
+
+impl<const N: usize> CanObserve<MerkleCap<BabyBear, [BabyBear; N]>> for GpuChallenger {
+    fn observe(&mut self, values: MerkleCap<BabyBear, [BabyBear; N]>) {
+        self.inner.observe(values);
+    }
+}
+
+impl<const N: usize> CanObserve<&MerkleCap<BabyBear, [BabyBear; N]>> for GpuChallenger {
+    fn observe(&mut self, values: &MerkleCap<BabyBear, [BabyBear; N]>) {
+        self.inner.observe(values);
+    }
+}
+
+impl<EF> CanSample<EF> for GpuChallenger
+where
+    EF: BasedVectorSpace<BabyBear>,
+{
+    fn sample(&mut self) -> EF {
+        self.inner.sample()
+    }
+}
+
+impl CanSampleBits<usize> for GpuChallenger {
+    fn sample_bits(&mut self, bits: usize) -> usize {
+        self.inner.sample_bits(bits)
+    }
+}
+
+impl FieldChallenger<BabyBear> for GpuChallenger {}
+
+impl GrindingChallenger for GpuChallenger {
+    type Witness = BabyBear;
+
+    #[tracing::instrument(name = "grind for proof-of-work witness", skip_all)]
+    fn grind(&mut self, bits: usize) -> BabyBear {
+        if bits == 0 {
+            return BabyBear::ZERO;
+        }
+
+        // Build the pre-permutation state from sponge_state + input_buffer,
+        // matching the CPU DuplexChallenger::grind logic.
+        let witness_idx = self.inner.input_buffer.len();
+        let mut base_state_monty = [0u32; 16];
+        for i in 0..16 {
+            let val = if i < self.inner.input_buffer.len() {
+                self.inner.input_buffer[i]
+            } else {
+                self.inner.sponge_state[i]
+            };
+            // BabyBear is #[repr(transparent)] over u32 in Montgomery form
+            base_state_monty[i] = unsafe { std::mem::transmute::<BabyBear, u32>(val) };
+        }
+
+        // Try GPU
+        if let Some(canonical_nonce) = self.dft.gpu_pow_grind(
+            &base_state_monty,
+            witness_idx as u32,
+            bits as u32,
+        ) {
+            // Convert canonical nonce back to BabyBear
+            let witness = BabyBear::new(canonical_nonce);
+            // Verify and update the challenger state (observe + sample)
+            assert!(
+                self.inner.check_witness(bits, witness),
+                "GPU PoW witness failed verification"
+            );
+            return witness;
+        }
+
+        // GPU didn't find (extremely unlikely) — fall back to CPU
+        self.inner.grind(bits)
+    }
+}
 
 #[cfg(test)]
 mod tests {

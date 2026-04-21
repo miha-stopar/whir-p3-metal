@@ -1888,3 +1888,61 @@ kernel void poseidon2_merkle_compress(
     uint out_start = gid * 8;
     for (uint i = 0; i < 8; i++) parents[out_start + i] = state[i];
 }
+
+// ── GPU Proof-of-Work (PoW) grinding ──────────────────────────────────
+// Parallel brute-force search for a valid PoW witness.
+// Each thread tries one candidate nonce, applies Poseidon2 permutation,
+// and checks whether the output satisfies the PoW condition.
+
+// Convert canonical u32 → Montgomery form:  (x * 2^32) mod P
+// Uses the identity: to_monty(x) = monty_reduce(x * R²), where
+// R² mod P is passed as a constant.
+Bb bb_from_canonical(uint x, Bb r_squared) {
+    return bb_mul(Bb{x}, r_squared);
+}
+
+// Convert Montgomery form → canonical u32:  monty_reduce(m)
+// Equivalent to bb_mul(x, Bb{1}).v — uses the same subtraction-based REDC.
+uint bb_to_canonical(Bb x) {
+    uint t = x.v * BB_MONTY_MU;
+    uint u_hi = mulhi(t, BB_P);
+    // x_hi = 0 (since x.v is 32-bit, mulhi(x.v, 1) = 0)
+    return u_hi == 0u ? 0u : BB_P - u_hi;
+}
+
+kernel void poseidon2_pow_grind(
+    constant uint*        base_state    [[buffer(0)]],   // 16 u32s (Montgomery form)
+    constant Bb*          rc            [[buffer(1)]],   // Poseidon2 round constants
+    constant uint&        witness_idx   [[buffer(2)]],
+    constant uint&        pow_bits      [[buffer(3)]],
+    constant uint&        r_squared     [[buffer(4)]],   // R² mod P (raw u32)
+    device atomic_uint*   result        [[buffer(5)]],   // output: winning nonce (canonical)
+    device atomic_uint*   found         [[buffer(6)]],   // flag: 0 → not yet found
+    constant uint&        nonce_offset  [[buffer(7)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (atomic_load_explicit(found, memory_order_relaxed)) return;
+
+    uint nonce = gid + nonce_offset;
+    if (nonce >= BB_P) return;
+
+    Bb state[16];
+    for (uint i = 0; i < 16; i++) state[i] = Bb{base_state[i]};
+
+    Bb r2 = Bb{r_squared};
+    state[witness_idx] = bb_from_canonical(nonce, r2);
+
+    poseidon2_permute_16(state, rc);
+
+    uint canonical = bb_to_canonical(state[7]);
+    uint mask = (1u << pow_bits) - 1u;
+
+    if ((canonical & mask) == 0u) {
+        uint expected = 0;
+        if (atomic_compare_exchange_weak_explicit(
+                found, &expected, 1u,
+                memory_order_relaxed, memory_order_relaxed)) {
+            atomic_store_explicit(result, nonce, memory_order_relaxed);
+        }
+    }
+}

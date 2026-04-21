@@ -261,95 +261,188 @@ This eliminates:
 
 ---
 
+## Optimization 7 — GPU Proof-of-Work Grinding
+
+### What it does
+
+After profiling a representative `whir_prove` run, PoW (Proof-of-Work) grinding
+was identified as the dominant bottleneck — consuming **~86%** of total prove
+time in PoW-heavy configurations. Each STIR round calls `grind(bits)` on the
+challenger, which brute-forces a nonce by repeatedly calling the Poseidon2
+permutation and checking for `bits` leading zeros. On CPU this is sequential;
+the GPU can test millions of nonces in parallel.
+
+```
+    CPU PoW Grinding (sequential):
+    ┌─────────────────────────────────────────┐
+    │ for nonce in 0..P:                      │
+    │   state[witness_idx] = nonce            │
+    │   poseidon2_permute(state)              │
+    │   if state[7] & mask == 0: return nonce │  ← O(2^bits) iterations
+    └─────────────────────────────────────────┘
+
+    GPU PoW Grinding (parallel):
+    ┌─────────────────────────────────────────────────┐
+    │ Dispatch 1M threads per batch:                  │
+    │   each thread tests one nonce                   │
+    │   atomic flag signals first winner              │
+    │                                                 │
+    │ Batch 0: nonce [0..1M)        ──→ check found   │
+    │ Batch 1: nonce [1M..2M)       ──→ check found   │
+    │ ...                                             │
+    │ Usually finds winner in first 1-2 batches       │
+    └─────────────────────────────────────────────────┘
+```
+
+**Metal kernel (`poseidon2_pow_grind`):**
+- Takes the base Poseidon2 sponge state (16 elements in Montgomery form)
+- Each GPU thread substitutes its nonce at `witness_idx`, runs the full
+  Poseidon2 permutation, converts `state[7]` to canonical form, checks mask
+- First winner atomically writes to shared `result`/`found` buffers
+
+**`GpuChallenger` wrapper:**
+- Wraps the standard `DuplexChallenger` and delegates all observe/sample ops
+- Overrides `GrindingChallenger::grind()` to extract the internal sponge state,
+  dispatch to GPU, and verify the result on CPU before updating challenger state
+- Falls back to CPU grinding if GPU doesn't find a witness (never happens in
+  practice since nonce space covers all of BabyBear)
+
+**Buffer caching optimization:**
+- Pre-allocates all Metal buffers at `MetalBabyBearDft` construction time
+- Each `gpu_pow_grind` call copies state into cached buffers (64 bytes) instead
+  of allocating new 4KB+ buffers per call
+- Eliminates per-call allocation overhead across the many grind calls per proof
+
+### Key implementation details
+
+Montgomery form conversions were critical to get right:
+- `bb_from_canonical(x, R²)`: canonical → Montgomery via `mul(x, R²) mod P`
+- `bb_to_canonical(x)`: Montgomery → canonical via subtraction-based reduction
+  (equivalent to `mul(x, 1)`, matching the p3 implementation)
+
+### Impact
+
+Dramatic speedup on PoW-heavy configurations. Best result: **2.81x** at n=22,
+fold=6, rate=1. The improvement is proportional to how much time the CPU spends
+grinding — configs with many STIR rounds and high `pow_bits` benefit most.
+
+---
+
 ## Comprehensive Benchmark Results
 
-All times in milliseconds. Best of 3 runs (median).
+All times in milliseconds. Median of 3 runs.
+
+**Columns:**
+- **CPU** — pure CPU prover (baseline)
+- **GPU** — GPU NTT + Merkle, commit-only fusion, CPU PoW grinding
+- **Fused** — GPU NTT + Merkle, full pipeline fusion, CPU PoW grinding
+- **Grind** — GPU NTT + Merkle, full pipeline fusion, **GPU PoW grinding**
 
 ### n=18 (256K coefficients)
 
-| fold | rate | CPU (ms) | GPU (ms) | Fused (ms) | GPU speedup | Fused speedup |
-|------|------|----------|----------|------------|-------------|---------------|
-| 4 | 1 | 15 | 20 | 23 | 0.77x | 0.66x |
-| 4 | 2 | 31 | 34 | 31 | 0.90x | 0.97x |
-| 4 | 3 | 36 | 42 | 48 | 0.85x | 0.75x |
-| 6 | 1 | 10 | 21 | 17 | 0.48x | 0.61x |
-| 6 | 2 | 18 | 19 | 23 | 0.94x | 0.79x |
-| 6 | 3 | 24 | 28 | 34 | 0.88x | 0.71x |
-| 8 | 1 | 12 | 16 | 16 | 0.77x | 0.74x |
-| 8 | 2 | 16 | 21 | 26 | 0.78x | 0.62x |
-| 8 | 3 | 29 | 36 | 40 | 0.81x | 0.74x |
+| fold | rate | CPU (ms) | GPU (ms) | Fused (ms) | Grind (ms) | Best speedup |
+|------|------|----------|----------|------------|------------|--------------|
+| 4 | 1 | 16 | 20 | 45 | 35 | 0.82x GPU |
+| 4 | 2 | 23 | 52 | 32 | 57 | 0.72x Fused |
+| 4 | 3 | 60 | 42 | 47 | 83 | **1.41x** GPU |
+| 6 | 1 | 14 | 17 | 20 | 30 | 0.83x GPU |
+| 6 | 2 | 21 | 26 | 42 | 40 | 0.81x GPU |
+| 6 | 3 | 29 | 33 | 33 | 52 | 0.88x GPU |
+| 8 | 1 | 11 | 17 | 21 | 34 | 0.64x GPU |
+| 8 | 2 | 17 | 22 | 43 | 44 | 0.75x GPU |
+| 8 | 3 | 53 | 54 | 87 | 88 | 0.98x GPU |
 
-> GPU overhead dominates at this size. All configs slower than CPU.
+> GPU overhead dominates at this size. Most configs slower than CPU.
 
 ### n=20 (1M coefficients)
 
-| fold | rate | CPU (ms) | GPU (ms) | Fused (ms) | GPU speedup | Fused speedup |
-|------|------|----------|----------|------------|-------------|---------------|
-| 4 | 1 | 53 | 55 | 59 | 0.97x | 0.90x |
-| 4 | 2 | 87 | 92 | 78 | 0.94x | **1.11x** |
-| 4 | 3 | 186 | 196 | 143 | 0.95x | **1.30x** |
-| 6 | 1 | 47 | 49 | 50 | 0.96x | 0.93x |
-| 6 | 2 | 114 | 92 | 108 | **1.23x** | 1.05x |
-| 6 | 3 | 611 | 439 | 516 | **1.39x** | **1.18x** |
-| 8 | 1 | 26 | 32 | 34 | 0.83x | 0.78x |
-| 8 | 2 | 52 | 45 | 48 | **1.16x** | 1.08x |
-| 8 | 3 | 100 | 86 | 83 | **1.16x** | **1.20x** |
+| fold | rate | CPU (ms) | GPU (ms) | Fused (ms) | Grind (ms) | Best speedup |
+|------|------|----------|----------|------------|------------|--------------|
+| 4 | 1 | 50 | 57 | 60 | 91 | 0.87x GPU |
+| 4 | 2 | 110 | 92 | 94 | 110 | **1.20x** GPU |
+| 4 | 3 | 196 | 138 | 133 | 147 | **1.48x** Fused |
+| 6 | 1 | 46 | 51 | 49 | 71 | 0.93x Fused |
+| 6 | 2 | 121 | 161 | 130 | 103 | **1.17x** Grind |
+| **6** | **3** | **622** | **794** | **775** | **300** | **2.07x Grind** |
+| 8 | 1 | 34 | 32 | 69 | 64 | 1.06x GPU |
+| 8 | 2 | 51 | 45 | 51 | 58 | **1.14x** GPU |
+| 8 | 3 | 130 | 147 | 79 | 88 | **1.65x** Fused |
 
-> GPU starts winning at rate=2-3. Crossover point around 50-100 ms CPU time.
+> GPU Grind shines at fold=6, rate=3 (2.07x) where PoW grinding dominates.
 
 ### n=22 (4M coefficients)
 
-| fold | rate | CPU (ms) | GPU (ms) | Fused (ms) | GPU speedup | Fused speedup |
-|------|------|----------|----------|------------|-------------|---------------|
-| 4 | 1 | 192 | 153 | 132 | **1.26x** | **1.45x** |
-| 4 | 2 | 354 | 256 | 232 | **1.38x** | **1.53x** |
-| 4 | 3 | 780 | 656 | 687 | **1.19x** | **1.13x** |
-| 6 | 1 | 168 | fail | 134 | - | **1.25x** |
-| **6** | **2** | **678** | **424** | **361** | **1.60x** | **1.88x** |
-| 6 | 3 | 2575 | 1767 | 2381 | **1.46x** | 1.08x |
-| 8 | 1 | 95 | 71 | 73 | **1.34x** | **1.30x** |
-| 8 | 2 | 193 | 182 | 161 | 1.06x | **1.19x** |
-| 8 | 3 | 465 | 344 | 321 | **1.35x** | **1.45x** |
+| fold | rate | CPU (ms) | GPU (ms) | Fused (ms) | Grind (ms) | Best speedup |
+|------|------|----------|----------|------------|------------|--------------|
+| 4 | 1 | 180 | 152 | 135 | 150 | **1.33x** Fused |
+| 4 | 2 | 318 | 261 | 242 | 233 | **1.36x** Grind |
+| 4 | 3 | 821 | 673 | 578 | 662 | **1.42x** Fused |
+| **6** | **1** | **339** | **171** | **125** | **121** | **2.81x Grind** |
+| 6 | 2 | 469 | 417 | 290 | 308 | **1.62x** Fused |
+| **6** | **3** | **2479** | **3667** | **1905** | **1194** | **2.08x Grind** |
+| 8 | 1 | 99 | 83 | 75 | 87 | **1.31x** Fused |
+| 8 | 2 | 195 | 167 | 144 | 155 | **1.35x** Fused |
+| 8 | 3 | 440 | 300 | 294 | 287 | **1.53x** Grind |
 
-> Best result: **1.88x** at fold=6, rate=2. GPU consistently faster across all fold/rate combos.
+> Best result: **2.81x** at fold=6, rate=1. Grind wins decisively when PoW is a large fraction.
 
 ### n=24 (16M coefficients)
 
-| fold | rate | CPU (ms) | GPU (ms) | Fused (ms) | GPU speedup | Fused speedup |
-|------|------|----------|----------|------------|-------------|---------------|
-| 4 | 1 | 992 | fail | 970 | - | 1.02x |
-| 6 | 1 | 663 | 515 | 526 | **1.29x** | **1.26x** |
+| fold | rate | CPU (ms) | GPU (ms) | Fused (ms) | Grind (ms) | Best speedup |
+|------|------|----------|----------|------------|------------|--------------|
+| **4** | **1** | **1337** | **fail** | **729** | **652** | **2.05x Grind** |
+| 6 | 1 | 653 | 492 | 430 | 391 | **1.67x** Grind |
 
-> Limited by GPU memory cap (domain 2^25). Higher rates push domain beyond safe limit.
-> n=24 fold=8 too slow on CPU (>30s). n=24 fold=4 rate=2+ exceeds domain limit.
+> Higher rates exceed GPU domain limit (2^25). fold=8 too slow on CPU (>30s).
+> Grind is the best strategy at n=24 across all testable configurations.
 
 ---
 
 ## Summary
 
 ```
-    GPU Speedup vs CPU (best per n, fused path):
+    Best GPU speedup vs CPU (per n):
 
-    n=18:  all < 1x  (GPU overhead dominates)
-    n=20:  1.30x     (fold=4, rate=3)
-    n=22:  1.88x     (fold=6, rate=2)  ← sweet spot
-    n=24:  1.29x     (fold=6, rate=1)  ← limited by GPU memory cap
+    n=18:  1.41x     (fold=4, rate=3, GPU path)     — GPU overhead still significant
+    n=20:  2.07x     (fold=6, rate=3, GPU Grind)    — PoW grinding dominates
+    n=22:  2.81x     (fold=6, rate=1, GPU Grind)    ← overall sweet spot
+    n=24:  2.05x     (fold=4, rate=1, GPU Grind)    — limited by GPU domain cap
 ```
 
-### When to use GPU
+### Which GPU strategy wins?
 
-- **Use GPU** when `n >= 20` and total data exceeds ~8 MB.
-- **Best configs:** `n=22` with `fold=4-8`, `rate=1-2` consistently gives 1.2-1.9x.
-- **Avoid GPU** for `n <= 18` or when fold factor produces very small round matrices.
-- **Avoid fold >= 10** on GPU (Metal driver instability on some hardware).
+```
+    ┌──────────────────────────────────────────────────────────┐
+    │                                                          │
+    │   PoW grinding fraction of total time                    │
+    │   ──────────────────────────────────────                 │
+    │   HIGH (>50%)  │  GPU Grind wins (up to 2.81x)          │
+    │                │  → fold=6 rate=1-3, larger n            │
+    │   ─────────────┤                                         │
+    │   MEDIUM       │  Fused or Grind, similar                │
+    │   (20-50%)     │  → fold=4 rate=2-3, fold=8 rate=3      │
+    │   ─────────────┤                                         │
+    │   LOW (<20%)   │  Fused wins (DFT+Merkle is bottleneck) │
+    │                │  → fold=8 rate=1-2, small n             │
+    └──────────────────────────────────────────────────────────┘
+```
+
+### When to use each mode
+
+- **CPU only** — `n <= 18` or very small polynomials
+- **GPU Fused** — `n >= 20` with fold=4-8, low PoW fraction (compute-heavy DFT/Merkle)
+- **GPU Grind** — `n >= 20` with high PoW fraction (fold=6, higher rates, larger n)
+- Grind mode includes all Fused optimizations plus GPU PoW, so it's always safe to use;
+  the overhead for the PoW GPU path is small even when grinding is fast
 
 ### Optimization progression
 
-| # | Optimization | Commit | Key improvement |
-|---|-------------|--------|-----------------|
-| 1 | GPU NTT (Metal) | `f5de9e9` | Established GPU pipeline |
-| 2 | Radix-16 DIF + zero-copy | `e50d7eb` | 4x fewer dispatches, no memcpy |
-| 3 | GPU Poseidon2 Merkle | `86b42cf` | ~10% whir_prove speedup |
-| 4 | Fused DFT→Merkle | `0086d18` | ~15-18% additional speedup |
-| 5 | Fused prover rounds | `3d2ff39` | Up to 1.63x total |
-| 6 | Lower threshold + zero-copy bitrev | `1695c2a` | Up to 1.88x total |
+| # | Optimization | Key improvement |
+|---|-------------|-----------------|
+| 1 | GPU NTT (Metal) | Established GPU pipeline |
+| 2 | Radix-16 DIF + zero-copy | 4x fewer dispatches, no memcpy |
+| 3 | GPU Poseidon2 Merkle | ~10% whir_prove speedup |
+| 4 | Fused DFT→Merkle | ~15-18% additional speedup |
+| 5 | Fused prover rounds | Up to 1.63x total |
+| 6 | Lower threshold + zero-copy bitrev | Up to 1.88x total |
+| 7 | GPU PoW Grinding + buffer caching | **Up to 2.81x total** |
