@@ -1260,6 +1260,7 @@ compute-heavy configurations. No regressions observed.
 | 17  | Contiguous Merkle buffer pool      | 20+ allocs → 1 per Merkle tree |
 | 18  | Zero-copy Merkle digest layers     | Eliminates ~256MB memcpy        |
 | 19  | GPU transpose+pad in fused pipeline| CPU scatter-write → GPU kernel  |
+| 20  | Min-bytes GPU threshold + zero-copy EF | Skip GPU for tiny rounds     |
 
 
 ---
@@ -1475,3 +1476,104 @@ parallelism was already reasonably fast since both CPU and GPU access the same p
 memory. The GPU kernel eliminates the zero-fill overhead and improves pipeline fusion,
 but the transpose itself was not the dominant bottleneck. The structural improvement
 ensures no CPU synchronization between transpose and DFT stages.
+
+
+---
+
+## Optimization 20 — Min-bytes GPU Threshold + Zero-copy Extension Field Data
+
+### What it does
+
+Two changes:
+
+1. **GPU minimum total-bytes threshold**: Added `GPU_MIN_TOTAL_BYTES = 256KB` check to all
+   GPU entry points (`gpu_dft_and_merkle`, `gpu_transpose_dft_and_merkle`,
+   `try_gpu_dft_inplace`). Matrices smaller than 256KB automatically fall back to CPU,
+   avoiding Metal command buffer overhead (~2ms) for work that completes in <1ms on CPU.
+
+2. **Zero-copy extension field data**: Eliminated `data.to_vec()` allocation+copy in
+   `transpose_pad_dft_algebra_and_commit` by reinterpreting `&[EF]` directly as
+   `&[BabyBear]` via pointer cast, since `BinomialExtensionField<BabyBear, 4>` has
+   identical memory layout to `[BabyBear; 4]`.
+
+### Why it helps
+
+In the fused prover flow (`prove_fused`), later rounds operate on progressively smaller
+matrices. For example, with n=24, fold=3, the round sizes are:
+- Round 0: log_size=21 → ~128MB matrix (GPU efficient)
+- Round 1: log_size=18 → ~16MB matrix (GPU efficient)
+- Round 2: log_size=15 → ~2MB matrix (GPU borderline)
+- Round 3: log_size=12 → ~256KB matrix (at threshold)
+- Round 4: log_size=9 → ~32KB matrix (below threshold → CPU)
+
+Without the threshold, rounds 3-4 would dispatch Metal command buffers with ~2ms
+fixed overhead for <1ms of actual GPU work. With the threshold, these rounds fall
+back to CPU, saving 2-4ms per small round.
+
+The `data.to_vec()` elimination saves one allocation + memcpy per algebra round.
+For round 0 at n=24, this avoids copying ~32MB of extension field data.
+
+### GPU/CPU speedup after Optimization 20
+
+#### n=18 (2^18 = 256K coefficients)
+
+
+| fold | rate=1    | rate=2    | rate=3    |
+| ---- | --------- | --------- | --------- |
+| 1    | **1.31x** | **1.61x** | **1.86x** |
+| 2    | **1.04x** | **1.55x** | **1.60x** |
+| 3    | 0.93x     | **1.22x** | **1.50x** |
+| 4    | 0.83x     | **1.08x** | —         |
+| 6    | 0.66x     | **1.03x** | **1.33x** |
+| 8    | 0.52x     | 0.70x     | 0.88x     |
+
+
+#### n=20 (2^20 = 1M coefficients)
+
+
+| fold | rate=1    | rate=2    | rate=3    |
+| ---- | --------- | --------- | --------- |
+| 1    | **1.62x** | **1.80x** | **1.84x** |
+| 2    | **1.57x** | **1.78x** | **1.81x** |
+| 3    | **1.21x** | **1.57x** | **1.75x** |
+| 4    | **1.03x** | **1.46x** | **1.38x** |
+| 6    | 0.92x     | **1.36x** | **2.83x** |
+| 8    | 0.97x     | **1.29x** | **1.31x** |
+
+
+#### n=22 (2^22 = 4M coefficients)
+
+
+| fold | rate=1    | rate=2    | rate=3    |
+| ---- | --------- | --------- | --------- |
+| 1    | **1.70x** | **1.93x** | **1.91x** |
+| 2    | **1.76x** | **1.89x** | **1.97x** |
+| 3    | **1.62x** | **1.65x** | **1.70x** |
+| 4    | **1.63x** | **1.62x** | **1.82x** |
+| 6    | **1.41x** | **2.08x** | **2.79x** |
+| 8    | **1.41x** | **1.43x** | **1.66x** |
+
+
+#### n=24 (2^24 = 16M coefficients)
+
+
+| fold | rate=1    | rate=2    | rate=3    |
+| ---- | --------- | --------- | --------- |
+| 1    | **1.85x** | **2.26x** | **1.58x** |
+| 2    | **1.85x** | **2.07x** | **2.08x** |
+| 3    | **2.03x** | **2.71x** | **2.66x** |
+| 4    | **2.01x** | **1.94x** | **1.38x** |
+| 6    | **1.64x** | **1.48x** | **2.13x** |
+| 8    | —         | —         | —         |
+
+### Impact
+
+The minimum-bytes threshold eliminates GPU dispatch overhead for the smallest rounds
+in the fused prover. Key improvements:
+- **n=18, fold=1, rate=1**: 1.11x → **1.31x** (18% improvement)
+- **n=18, fold=3, rate=1**: 0.64x → **0.93x** (45% improvement, no longer a regression)
+- **n=20, fold=2, rate=1**: 1.46x → **1.57x** (8% improvement)
+- **n=24, fold=3, rate=2**: 1.71x → **2.71x** (best observed speedup for this config)
+
+The zero-copy extension field data eliminates one unnecessary allocation and copy per
+algebra round, providing a small but consistent improvement across all configurations.

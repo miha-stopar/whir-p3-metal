@@ -372,6 +372,9 @@ impl MetalBabyBearDft {
     /// while blocking tall-and-narrow ones.
     const GPU_MAX_LOG_N: u32 = 24;
     const GPU_MAX_TOTAL_BYTES: usize = 1024 * 1024 * 1024;
+    /// Minimum total bytes for GPU dispatch. Below this threshold, Metal
+    /// command buffer overhead dominates actual computation time.
+    const GPU_MIN_TOTAL_BYTES: usize = 256 * 1024;
     /// Default Poseidon2 RNG seed (must match the seed used to construct the permutation).
     const DEFAULT_POSEIDON2_SEED: u64 = 1;
 
@@ -980,7 +983,7 @@ impl MetalBabyBearDft {
             return None;
         }
         let total_bytes_val = height * width * size_of::<u32>();
-        if total_bytes_val > Self::GPU_MAX_TOTAL_BYTES {
+        if total_bytes_val > Self::GPU_MAX_TOTAL_BYTES || total_bytes_val < Self::GPU_MIN_TOTAL_BYTES {
             return None;
         }
 
@@ -1136,7 +1139,7 @@ impl MetalBabyBearDft {
             return None;
         }
         let total_bytes_val = total_out * size_of::<u32>();
-        if total_bytes_val > Self::GPU_MAX_TOTAL_BYTES {
+        if total_bytes_val > Self::GPU_MAX_TOTAL_BYTES || total_bytes_val < Self::GPU_MIN_TOTAL_BYTES {
             return None;
         }
 
@@ -1530,7 +1533,7 @@ impl MetalBabyBearDft {
             return None;
         }
         let total_bytes_val = height * width * size_of::<u32>();
-        if total_bytes_val > Self::GPU_MAX_TOTAL_BYTES {
+        if total_bytes_val > Self::GPU_MAX_TOTAL_BYTES || total_bytes_val < Self::GPU_MIN_TOTAL_BYTES {
             return None;
         }
 
@@ -2574,9 +2577,11 @@ where
         EF: p3_field::ExtensionField<BabyBear> + BasedVectorSpace<BabyBear> + Clone + Send + Sync,
     {
         let d = EF::DIMENSION;
-        let base_data = EF::flatten_to_base(data.to_vec());
+        let base_data: &[BabyBear] = unsafe {
+            std::slice::from_raw_parts(data.as_ptr().cast(), data.len() * d)
+        };
         let (values, result) =
-            self.gpu.gpu_transpose_dft_and_merkle(&base_data, in_rows, in_cols, padded_height, d)?;
+            self.gpu.gpu_transpose_dft_and_merkle(base_data, in_rows, in_cols, padded_height, d)?;
         let ef_values = EF::reconstitute_from_base(values);
         let ef_mat = RowMajorMatrix::new(ef_values, in_rows);
         let flat_view = p3_matrix::extension::FlatMatrixView::new(ef_mat);
