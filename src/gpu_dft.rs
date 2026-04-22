@@ -2389,12 +2389,23 @@ impl<P, PW, H, C> GpuMmcs<P, PW, H, C, 2, 8> {
     {
         let init_width = mat.width();
         let height = mat.height();
-        let mut base_values = EF::flatten_to_base(mat.values);
-        let base_width = init_width * EF::DIMENSION;
+        let d = EF::DIMENSION;
+        let base_width = init_width * d;
+
+        let ef_vec = mat.values;
+        let (ef_len, ef_cap) = (ef_vec.len(), ef_vec.capacity());
+        let ptr = ef_vec.as_ptr() as *mut BabyBear;
+        std::mem::forget(ef_vec);
+        let mut base_values = unsafe { Vec::from_raw_parts(ptr, ef_len * d, ef_cap * d) };
 
         let result = self.gpu.gpu_dft_and_merkle(&mut base_values, height, base_width)?;
 
-        let ef_values = EF::reconstitute_from_base(base_values);
+        let ef_values = {
+            let (len, cap) = (base_values.len(), base_values.capacity());
+            let p = base_values.as_ptr() as *mut EF;
+            std::mem::forget(base_values);
+            unsafe { Vec::from_raw_parts(p, len / d, cap / d) }
+        };
         let ef_mat = RowMajorMatrix::new(ef_values, init_width);
         let flat_view = p3_matrix::extension::FlatMatrixView::new(ef_mat);
 
@@ -2544,19 +2555,30 @@ where
     {
         let init_width = mat.width();
         let height = mat.height();
-        let mut base_values = EF::flatten_to_base(mat.values);
-        let base_width = init_width * EF::DIMENSION;
+        let d = EF::DIMENSION;
+        let base_width = init_width * d;
+
+        let ef_vec = mat.values;
+        let (ef_len, ef_cap) = (ef_vec.len(), ef_vec.capacity());
+        let ptr = ef_vec.as_ptr() as *mut BabyBear;
+        std::mem::forget(ef_vec);
+        let mut base_values = unsafe { Vec::from_raw_parts(ptr, ef_len * d, ef_cap * d) };
+
+        let reconstitute_ef = |base: Vec<BabyBear>| -> Vec<EF> {
+            let (len, cap) = (base.len(), base.capacity());
+            let p = base.as_ptr() as *mut EF;
+            std::mem::forget(base);
+            unsafe { Vec::from_raw_parts(p, len / d, cap / d) }
+        };
 
         match self.gpu.gpu_dft_and_merkle(&mut base_values, height, base_width) {
             Some(result) => {
-                let ef_values = EF::reconstitute_from_base(base_values);
-                let ef_mat = RowMajorMatrix::new(ef_values, init_width);
+                let ef_mat = RowMajorMatrix::new(reconstitute_ef(base_values), init_width);
                 let flat_view = p3_matrix::extension::FlatMatrixView::new(ef_mat);
                 Ok(result.into_tree(vec![flat_view]))
             }
             None => {
-                let ef_values = EF::reconstitute_from_base(base_values);
-                Err(RowMajorMatrix::new(ef_values, init_width))
+                Err(RowMajorMatrix::new(reconstitute_ef(base_values), init_width))
             }
         }
     }
@@ -2593,7 +2615,12 @@ where
         };
         let (values, result) =
             self.gpu.gpu_transpose_dft_and_merkle(base_data, in_rows, in_cols, padded_height, d)?;
-        let ef_values = EF::reconstitute_from_base(values);
+        let ef_values = {
+            let (len, cap) = (values.len(), values.capacity());
+            let p = values.as_ptr() as *mut EF;
+            std::mem::forget(values);
+            unsafe { Vec::from_raw_parts(p, len / d, cap / d) }
+        };
         let ef_mat = RowMajorMatrix::new(ef_values, in_rows);
         let flat_view = p3_matrix::extension::FlatMatrixView::new(ef_mat);
         Some(result.into_tree(vec![flat_view]))
