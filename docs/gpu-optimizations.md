@@ -1258,5 +1258,106 @@ compute-heavy configurations. No regressions observed.
 | 15  | Arc sharing + alloc elimination    | Small-n overhead eliminated     |
 | 16  | Fused leaf hash + first compress   | Eliminates 128MB read for n=22  |
 | 17  | Contiguous Merkle buffer pool      | 20+ allocs → 1 per Merkle tree |
+| 18  | Zero-copy Merkle digest layers     | Eliminates ~256MB memcpy        |
 
+
+---
+
+## Optimization 18 — Zero-copy Merkle Digest Layers
+
+### What it does
+
+Eliminates the entire CPU-side `memcpy` of Merkle tree digest layers after
+GPU computation. Previously, all digest layers (~256MB for n=22) were copied
+from the Metal buffer into freshly-allocated Rust `Vec`s using
+`fast_memcpy_from_gpu`. Now, the `MerkleTree` directly references the Metal
+buffer's unified memory through `Vec::from_raw_parts`, and the buffer is
+kept alive by an opaque keepalive handle stored in the `MerkleTree` struct.
+
+### How it works
+
+1. **Patched `MerkleTree`** gains `gpu_backed_layers` and `_keepalive`
+   fields (both `#[serde(skip)]`). A custom `Drop` implementation
+   `std::mem::forget`s the GPU-backed layers to prevent Rust from calling
+   `dealloc` on Metal-managed memory.
+
+2. **`read_merkle_layers_zero_copy`** replaces `read_merkle_layers`. Instead
+   of memcpy, it creates Vecs via `Vec::from_raw_parts` pointing into the
+   Metal buffer and moves the `Buffer` into a `Box<dyn Any + Send + Sync>`
+   keepalive.
+
+3. **`GpuMerkleResult`** bundles the cap, digest layers, arity schedule,
+   and GPU-backing info. Its `into_tree()` method constructs the
+   `MerkleTree` with the correct backing (GPU or owned) transparently.
+
+### Why it helps
+
+- **No memcpy**: Eliminates copying all Merkle digest layers (~256MB for
+  n=22, ~1GB for n=24) from Metal buffer to Rust heap.
+- **Lower peak memory**: No duplicate of digest data in both Metal buffer
+  and Rust heap.
+- **Apple Silicon unified memory**: Metal `StorageModeShared` buffers are
+  directly CPU-accessible with no coherency overhead after GPU completion.
+- **Random access is fine**: Opening proofs access O(log n) digests per
+  query — the sporadic cache misses on Metal buffer memory are negligible.
+
+### Impact
+
+Structural improvement. On Apple Silicon, the Metal buffer readback was
+already fast (~5-20ms via parallel non-temporal loads), which is <1% of
+total prover time for n≥22. Benchmarks show no measurable change (within
+noise), confirming the optimization is correct with no regressions.
+
+### GPU/CPU speedup after Optimization 18
+
+#### n=18 (2^18 = 256K coefficients)
+
+
+| fold | rate=1    | rate=2    | rate=3    |
+| ---- | --------- | --------- | --------- |
+| 1    | **1.11x** | **1.49x** | **1.71x** |
+| 2    | **1.05x** | **1.38x** | **1.69x** |
+| 3    | 0.94x     | **1.20x** | **1.73x** |
+| 4    | 0.82x     | **1.18x** | **1.44x** |
+| 6    | 0.75x     | **1.26x** | **1.32x** |
+| 8    | 0.47x     | 0.82x     | 0.87x     |
+
+
+#### n=20 (2^20 = 1M coefficients)
+
+
+| fold | rate=1    | rate=2    | rate=3    |
+| ---- | --------- | --------- | --------- |
+| 1    | **1.59x** | **1.90x** | **1.80x** |
+| 2    | **1.46x** | **1.87x** | **2.04x** |
+| 3    | **1.44x** | **1.53x** | **1.71x** |
+| 4    | **1.10x** | **1.56x** | **1.43x** |
+| 6    | **1.08x** | **1.61x** | **1.49x** |
+| 8    | 0.81x     | **1.28x** | **1.51x** |
+
+
+#### n=22 (2^22 = 4M coefficients)
+
+
+| fold | rate=1    | rate=2    | rate=3    |
+| ---- | --------- | --------- | --------- |
+| 1    | **2.03x** | **1.86x** | **1.85x** |
+| 2    | **1.74x** | **1.94x** | **2.01x** |
+| 3    | **1.54x** | **1.71x** | **2.02x** |
+| 4    | **1.61x** | **1.73x** | **1.79x** |
+| 6    | **1.49x** | **1.46x** | **2.15x** |
+| 8    | **1.41x** | **1.48x** | **1.88x** |
+
+
+#### n=24 (2^24 = 16M coefficients)
+
+
+| fold | rate=1    | rate=2    | rate=3    |
+| ---- | --------- | --------- | --------- |
+| 1    | **1.79x** | **2.13x** | **1.40x** |
+| 2    | **1.74x** | **2.09x** | **2.00x** |
+| 3    | **1.96x** | **1.84x** | **2.15x** |
+| 4    | **1.72x** | **1.82x** | **3.95x** |
+| 6    | **1.65x** | **1.81x** | **3.48x** |
+| 8    | —         | —         | —         |
 

@@ -1,5 +1,7 @@
+use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::any::Any;
 use core::array;
 use core::cmp::Reverse;
 use core::marker::PhantomData;
@@ -28,43 +30,63 @@ use tracing::instrument;
 ///
 /// This generally shouldn't be used directly. If you're using a Merkle tree as an MMCS,
 /// see `MerkleTreeMmcs`.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct MerkleTree<F, W, M, const N: usize, const DIGEST_ELEMS: usize> {
     /// All leaf matrices in insertion order.
-    ///
-    /// Each matrix contributes rows to one or more digest layers, depending on its height.
-    /// Specifically, only the tallest matrices are included in the first digest layer,
-    /// while shorter matrices are injected into higher digest layers at positions determined
-    /// by their padded heights.
-    ///
-    /// This vector is retained only for inspection or re-opening of the tree; it is not used
-    /// after construction time.
     pub(crate) leaves: Vec<M>,
 
     /// All intermediate digest layers, index 0 being the first layer above
     /// the leaves and the last layer containing exactly one root digest.
-    ///
-    /// Every inner vector holds contiguous digests `[left₀, right₀, left₁,
-    /// right₁, …]`; higher layers refer to these by index.
-    ///
-    /// Serialization requires that `[W; DIGEST_ELEMS]` implements `Serialize` and
-    /// `Deserialize`. This is automatically satisfied when `W` is a fixed-size type.
     #[serde(
         bound(serialize = "[W; DIGEST_ELEMS]: Serialize"),
         bound(deserialize = "[W; DIGEST_ELEMS]: Deserialize<'de>")
     )]
     pub(crate) digest_layers: Vec<Vec<[W; DIGEST_ELEMS]>>,
 
-    /// The compression arity used at each tree level (transition from
-    /// `digest_layers[i]` to `digest_layers[i+1]`).
-    ///
-    /// Each entry is either `N` (full N-ary step) as specified by the `N`
-    /// parameter associated to the compression function, or `2` (binary step)
-    /// when a matrix injection falls between N-ary levels.
+    /// The compression arity used at each tree level.
     pub(crate) arity_schedule: Vec<usize>,
 
-    /// Zero-sized marker that binds the generic `F` but occupies no space.
     _phantom: PhantomData<F>,
+
+    /// Number of digest layers (from index 0) whose backing memory is owned
+    /// externally (e.g. a GPU Metal buffer). These layers must NOT be
+    /// deallocated by Vec's Drop — see the custom `Drop` impl below.
+    #[serde(skip, default)]
+    gpu_backed_layers: usize,
+
+    /// Opaque handle that keeps the external memory alive while the tree
+    /// exists.  Dropped *after* the custom `Drop` forgets the GPU-backed
+    /// layers, so the memory is valid for the entire tree lifetime.
+    #[serde(skip, default)]
+    _keepalive: Option<Box<dyn Any + Send + Sync>>,
+}
+
+impl<F, W, M, const N: usize, const DIGEST_ELEMS: usize> core::fmt::Debug
+    for MerkleTree<F, W, M, N, DIGEST_ELEMS>
+where
+    F: core::fmt::Debug,
+    W: core::fmt::Debug,
+    M: core::fmt::Debug,
+{
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("MerkleTree")
+            .field("leaves", &self.leaves)
+            .field("digest_layers", &self.digest_layers)
+            .field("arity_schedule", &self.arity_schedule)
+            .field("gpu_backed_layers", &self.gpu_backed_layers)
+            .finish()
+    }
+}
+
+impl<F, W, M, const N: usize, const DIGEST_ELEMS: usize> Drop
+    for MerkleTree<F, W, M, N, DIGEST_ELEMS>
+{
+    fn drop(&mut self) {
+        for i in 0..self.gpu_backed_layers {
+            let layer = core::mem::replace(&mut self.digest_layers[i], Vec::new());
+            core::mem::forget(layer);
+        }
+    }
 }
 
 impl<F: Clone + Send + Sync, W: Clone, M: Matrix<F>, const N: usize, const DIGEST_ELEMS: usize>
@@ -76,7 +98,40 @@ impl<F: Clone + Send + Sync, W: Clone, M: Matrix<F>, const N: usize, const DIGES
         digest_layers: Vec<Vec<[W; DIGEST_ELEMS]>>,
         arity_schedule: Vec<usize>,
     ) -> Self {
-        Self { leaves, digest_layers, arity_schedule, _phantom: PhantomData }
+        Self {
+            leaves, digest_layers, arity_schedule,
+            _phantom: PhantomData,
+            gpu_backed_layers: 0,
+            _keepalive: None,
+        }
+    }
+
+    /// Construct a tree with digest layers whose backing memory is owned
+    /// externally (e.g. a GPU Metal buffer).  The first `gpu_backed_layers`
+    /// entries of `digest_layers` are `Vec`s created via
+    /// `Vec::from_raw_parts` pointing into the memory held by `keepalive`.
+    /// On drop, those layers are forgotten (not deallocated); the keepalive
+    /// handle is dropped afterwards, releasing the external memory.
+    ///
+    /// # Safety
+    /// The caller must guarantee that:
+    /// - The first `gpu_backed_layers` Vecs were created via
+    ///   `Vec::from_raw_parts` from pointers inside `keepalive`.
+    /// - `keepalive` outlives all reads (guaranteed by field drop order).
+    /// - The memory is valid for reads for the lifetime of `keepalive`.
+    pub unsafe fn from_parts_gpu_backed(
+        leaves: Vec<M>,
+        digest_layers: Vec<Vec<[W; DIGEST_ELEMS]>>,
+        arity_schedule: Vec<usize>,
+        gpu_backed_layers: usize,
+        keepalive: Box<dyn Any + Send + Sync>,
+    ) -> Self {
+        Self {
+            leaves, digest_layers, arity_schedule,
+            _phantom: PhantomData,
+            gpu_backed_layers,
+            _keepalive: Some(keepalive),
+        }
     }
 
     /// Build a tree from **one or more matrices**.
@@ -181,6 +236,8 @@ impl<F: Clone + Send + Sync, W: Clone, M: Matrix<F>, const N: usize, const DIGES
             digest_layers,
             arity_schedule,
             _phantom: PhantomData,
+            gpu_backed_layers: 0,
+            _keepalive: None,
         }
     }
 

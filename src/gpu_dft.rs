@@ -328,6 +328,35 @@ struct MerkleLayers {
     num_digests: Vec<u32>,
 }
 
+struct MerkleBufferKeepalive(Buffer);
+
+pub struct GpuMerkleResult {
+    pub cap: p3_symmetric::MerkleCap<BabyBear, [BabyBear; 8]>,
+    pub digest_layers: Vec<Vec<[BabyBear; 8]>>,
+    pub arity_schedule: Vec<usize>,
+    gpu_backed: Option<(usize, Box<dyn std::any::Any + Send + Sync>)>,
+}
+
+impl GpuMerkleResult {
+    pub fn into_tree<M: p3_matrix::Matrix<BabyBear>>(self, leaves: Vec<M>) -> (
+        p3_symmetric::MerkleCap<BabyBear, [BabyBear; 8]>,
+        p3_merkle_tree::MerkleTree<BabyBear, BabyBear, M, 2, 8>,
+    ) {
+        let tree = match self.gpu_backed {
+            Some((count, keepalive)) => unsafe {
+                p3_merkle_tree::MerkleTree::from_parts_gpu_backed(
+                    leaves, self.digest_layers, self.arity_schedule,
+                    count, keepalive,
+                )
+            },
+            None => p3_merkle_tree::MerkleTree::from_parts(
+                leaves, self.digest_layers, self.arity_schedule,
+            ),
+        };
+        (self.cap, tree)
+    }
+}
+
 fn align_up(x: u64, align: u64) -> u64 {
     (x + align - 1) & !(align - 1)
 }
@@ -906,19 +935,46 @@ impl MetalBabyBearDft {
         (cap, digest_layers, arity_schedule)
     }
 
+    /// Zero-copy variant: digest layers reference the Metal buffer directly
+    /// rather than copying ~256MB.  The buffer is moved into a keepalive
+    /// handle that the MerkleTree holds until it is dropped.
+    fn read_merkle_layers_zero_copy(layers: MerkleLayers) -> GpuMerkleResult {
+        let base_ptr = layers.buf.contents() as *const u8;
+        let num_layers = layers.num_digests.len();
+        let arity_schedule = vec![2usize; num_layers.saturating_sub(1)];
+
+        let root_offset = *layers.offsets.last().unwrap();
+        let root_digest = unsafe {
+            *(base_ptr.add(root_offset as usize) as *const [BabyBear; 8])
+        };
+        let cap = p3_symmetric::MerkleCap::new(vec![root_digest]);
+
+        let digest_layers: Vec<Vec<[BabyBear; 8]>> = layers.num_digests
+            .iter()
+            .zip(layers.offsets.iter())
+            .map(|(&count, &offset)| {
+                let n = count as usize;
+                let ptr = unsafe { base_ptr.add(offset as usize) as *mut [BabyBear; 8] };
+                unsafe { Vec::from_raw_parts(ptr, n, n) }
+            })
+            .collect();
+
+        let keepalive: Box<dyn std::any::Any + Send + Sync> =
+            Box::new(MerkleBufferKeepalive(layers.buf));
+        GpuMerkleResult {
+            cap, digest_layers, arity_schedule,
+            gpu_backed: Some((num_layers, keepalive)),
+        }
+    }
+
     /// Fused DFT + Merkle tree: runs NTT and Poseidon2 hashing in a single
     /// GPU command buffer, avoiding the CPU round-trip between them.
-    /// Returns `(cap, digest_layers, arity_schedule, output_values)`.
     pub fn gpu_dft_and_merkle(
         &self,
         values: &mut Vec<BabyBear>,
         height: usize,
         width: usize,
-    ) -> Option<(
-        p3_symmetric::MerkleCap<BabyBear, [BabyBear; 8]>,
-        Vec<Vec<[BabyBear; 8]>>,
-        Vec<usize>,
-    )> {
+    ) -> Option<GpuMerkleResult> {
         let log_n = log2_strict_usize(height) as u32;
         if log_n < self.gpu_min_log_n || log_n > Self::GPU_MAX_LOG_N {
             return None;
@@ -1057,9 +1113,7 @@ impl MetalBabyBearDft {
         }
 
         gpu_result.map(|(_, merkle)| {
-            let result = Self::read_merkle_layers(&merkle);
-            self.release_merkle_layers(merkle);
-            result
+            Self::read_merkle_layers_zero_copy(merkle)
         })
     }
 
@@ -1073,12 +1127,7 @@ impl MetalBabyBearDft {
         in_cols: usize,
         out_height: usize,
         elem_size: usize,
-    ) -> Option<(
-        Vec<BabyBear>,
-        p3_symmetric::MerkleCap<BabyBear, [BabyBear; 8]>,
-        Vec<Vec<[BabyBear; 8]>>,
-        Vec<usize>,
-    )> {
+    ) -> Option<(Vec<BabyBear>, GpuMerkleResult)> {
         let out_width = in_rows * elem_size;
         let total_out = out_height * out_width;
         let log_n = log2_strict_usize(out_height) as u32;
@@ -1162,9 +1211,7 @@ impl MetalBabyBearDft {
         Self::release_buf(&self.temp_buf_cache, natural_buf);
 
         gpu_result.map(|(merkle, out_values)| {
-            let (cap, digest_layers, arity_schedule) = Self::read_merkle_layers(&merkle);
-            self.release_merkle_layers(merkle);
-            (out_values, cap, digest_layers, arity_schedule)
+            (out_values, Self::read_merkle_layers_zero_copy(merkle))
         })
     }
 
@@ -1405,11 +1452,7 @@ impl MetalBabyBearDft {
         data: &[BabyBear],
         height: usize,
         width: usize,
-    ) -> (
-        p3_symmetric::MerkleCap<BabyBear, [BabyBear; 8]>,
-        Vec<Vec<[BabyBear; 8]>>,
-        Vec<usize>,
-    ) {
+    ) -> GpuMerkleResult {
         let total_bytes = (height * width * size_of::<u32>()) as u64;
         let opts = MTLResourceOptions::CPUCacheModeDefaultCache
             | MTLResourceOptions::StorageModeShared;
@@ -1431,20 +1474,14 @@ impl MetalBabyBearDft {
             merkle
         });
 
-        let result = Self::read_merkle_layers(&merkle);
-        self.release_merkle_layers(merkle);
-        result
+        Self::read_merkle_layers_zero_copy(merkle)
     }
 
     /// Build Merkle digest layers on GPU from a row-major matrix.
     pub fn gpu_build_merkle_digests(
         &self,
         mat: &RowMajorMatrix<BabyBear>,
-    ) -> (
-        p3_symmetric::MerkleCap<BabyBear, [BabyBear; 8]>,
-        Vec<Vec<[BabyBear; 8]>>,
-        Vec<usize>,
-    ) {
+    ) -> GpuMerkleResult {
         self.gpu_build_merkle_digests_raw(&mat.values, mat.height(), mat.width())
     }
 
@@ -1457,13 +1494,7 @@ impl MetalBabyBearDft {
         p3_symmetric::MerkleCap<BabyBear, [BabyBear; 8]>,
         p3_merkle_tree::MerkleTree<BabyBear, BabyBear, RowMajorMatrix<BabyBear>, 2, 8>,
     ) {
-        let (cap, digest_layers, arity_schedule) = self.gpu_build_merkle_digests(&mat);
-        let tree = p3_merkle_tree::MerkleTree::from_parts(
-            vec![mat],
-            digest_layers,
-            arity_schedule,
-        );
-        (cap, tree)
+        self.gpu_build_merkle_digests(&mat).into_tree(vec![mat])
     }
 
     /// Try to wrap the Vec's memory directly as a Metal buffer (zero-copy).
@@ -2317,16 +2348,8 @@ impl<P, PW, H, C> GpuMmcs<P, PW, H, C, 2, 8> {
         let height = mat.height();
         let width = mat.width();
 
-        let (cap, digest_layers, arity_schedule) =
-            self.gpu.gpu_dft_and_merkle(&mut mat.values, height, width)?;
-
-        let tree = p3_merkle_tree::MerkleTree::from_parts(
-            vec![mat],
-            digest_layers,
-            arity_schedule,
-        );
-
-        Some((cap, tree))
+        let result = self.gpu.gpu_dft_and_merkle(&mut mat.values, height, width)?;
+        Some(result.into_tree(vec![mat]))
     }
 
     /// Fused extension-field DFT + Merkle commit.
@@ -2351,20 +2374,13 @@ impl<P, PW, H, C> GpuMmcs<P, PW, H, C, 2, 8> {
         let mut base_values = EF::flatten_to_base(mat.values);
         let base_width = init_width * EF::DIMENSION;
 
-        let (cap, digest_layers, arity_schedule) =
-            self.gpu.gpu_dft_and_merkle(&mut base_values, height, base_width)?;
+        let result = self.gpu.gpu_dft_and_merkle(&mut base_values, height, base_width)?;
 
         let ef_values = EF::reconstitute_from_base(base_values);
         let ef_mat = RowMajorMatrix::new(ef_values, init_width);
         let flat_view = p3_matrix::extension::FlatMatrixView::new(ef_mat);
 
-        let tree = p3_merkle_tree::MerkleTree::from_parts(
-            vec![flat_view],
-            digest_layers,
-            arity_schedule,
-        );
-
-        Some((cap, tree))
+        Some(result.into_tree(vec![flat_view]))
     }
 }
 
@@ -2402,7 +2418,7 @@ where
                     unsafe { p0.add(width) == p1 }
                 };
 
-                let (cap, digest_layers, arity_schedule) = if is_contiguous {
+                let result = if is_contiguous {
                     let s0 = inputs[0].row_slice(0).unwrap();
                     let ptr = (*s0).as_ptr();
                     let total = height * width;
@@ -2421,12 +2437,7 @@ where
                     self.gpu.gpu_build_merkle_digests(&rm)
                 };
 
-                let tree = p3_merkle_tree::MerkleTree::from_parts(
-                    inputs,
-                    digest_layers,
-                    arity_schedule,
-                );
-                return (cap, tree);
+                return result.into_tree(inputs);
             }
         }
         self.inner.commit(inputs)
@@ -2491,12 +2502,7 @@ where
         let height = mat.height();
         let width = mat.width();
         match self.gpu.gpu_dft_and_merkle(&mut mat.values, height, width) {
-            Some((cap, digest_layers, arity_schedule)) => {
-                let tree = p3_merkle_tree::MerkleTree::from_parts(
-                    vec![mat], digest_layers, arity_schedule,
-                );
-                Ok((cap, tree))
-            }
+            Some(result) => Ok(result.into_tree(vec![mat])),
             None => Err(mat),
         }
     }
@@ -2520,14 +2526,11 @@ where
         let base_width = init_width * EF::DIMENSION;
 
         match self.gpu.gpu_dft_and_merkle(&mut base_values, height, base_width) {
-            Some((cap, digest_layers, arity_schedule)) => {
+            Some(result) => {
                 let ef_values = EF::reconstitute_from_base(base_values);
                 let ef_mat = RowMajorMatrix::new(ef_values, init_width);
                 let flat_view = p3_matrix::extension::FlatMatrixView::new(ef_mat);
-                let tree = p3_merkle_tree::MerkleTree::from_parts(
-                    vec![flat_view], digest_layers, arity_schedule,
-                );
-                Ok((cap, tree))
+                Ok(result.into_tree(vec![flat_view]))
             }
             None => {
                 let ef_values = EF::reconstitute_from_base(base_values);
@@ -2543,13 +2546,10 @@ where
         in_cols: usize,
         padded_height: usize,
     ) -> Option<(Self::Commitment, Self::ProverData<RowMajorMatrix<BabyBear>>)> {
-        let (values, cap, digest_layers, arity_schedule) =
+        let (values, result) =
             self.gpu.gpu_transpose_dft_and_merkle(data, in_rows, in_cols, padded_height, 1)?;
         let mat = RowMajorMatrix::new(values, in_rows);
-        let tree = p3_merkle_tree::MerkleTree::from_parts(
-            vec![mat], digest_layers, arity_schedule,
-        );
-        Some((cap, tree))
+        Some(result.into_tree(vec![mat]))
     }
 
     fn transpose_pad_dft_algebra_and_commit<EF>(
@@ -2567,15 +2567,12 @@ where
     {
         let d = EF::DIMENSION;
         let base_data = EF::flatten_to_base(data.to_vec());
-        let (values, cap, digest_layers, arity_schedule) =
+        let (values, result) =
             self.gpu.gpu_transpose_dft_and_merkle(&base_data, in_rows, in_cols, padded_height, d)?;
         let ef_values = EF::reconstitute_from_base(values);
         let ef_mat = RowMajorMatrix::new(ef_values, in_rows);
         let flat_view = p3_matrix::extension::FlatMatrixView::new(ef_mat);
-        let tree = p3_merkle_tree::MerkleTree::from_parts(
-            vec![flat_view], digest_layers, arity_schedule,
-        );
-        Some((cap, tree))
+        Some(result.into_tree(vec![flat_view]))
     }
 }
 
