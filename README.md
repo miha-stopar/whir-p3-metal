@@ -79,79 +79,44 @@ mapping efficiently to Apple GPU's ALU.
 
 ### Benchmarks
 
-All benchmarks on Apple M-series silicon (unified memory). Best of 3 runs
-(median). Parameters:
+Apple M1, macOS 15.5, Rust nightly 1.97.0, release + LTO.
+3 runs per config, **median** reported. All times in milliseconds.
+
+Parameters:
 - `n` = `num_variables` (polynomial has 2^n coefficients)
 - `fold` = `folding_factor` (each STIR round folds 2^fold evaluations)
-- `rate` = `starting_log_inv_rate` (RS code rate = 1/2^rate, domain = 2^(n+rate) points)
-- **GPU** = fused initial commit only (rounds use separate DFT + commit)
-- **Fused** = fused initial commit + fused per-round DFT+Merkle (`prove_fused`)
+- `rate` = `starting_log_inv_rate` (RS code rate = 1/2^rate)
+- **GPU** = GPU DFT + Merkle, CPU challenger
+- **FUSED** = fused DFT+Merkle pipeline, CPU challenger
+- **GRIND** = fused pipeline + GPU PoW grinding
 
-#### n=18 (256K coefficients)
-
-| fold | rate | CPU (ms) | GPU (ms) | Fused (ms) | GPU | Fused |
-|------|------|----------|----------|------------|-----|-------|
-| 4 | 1 | 15 | 20 | 23 | 0.77x | 0.66x |
-| 4 | 2 | 31 | 34 | 31 | 0.90x | 0.97x |
-| 4 | 3 | 36 | 42 | 48 | 0.85x | 0.75x |
-| 6 | 1 | 10 | 21 | 17 | 0.48x | 0.61x |
-| 6 | 2 | 18 | 19 | 23 | 0.94x | 0.79x |
-| 6 | 3 | 24 | 28 | 34 | 0.88x | 0.71x |
-| 8 | 1 | 12 | 16 | 16 | 0.77x | 0.74x |
-| 8 | 2 | 16 | 21 | 26 | 0.78x | 0.62x |
-| 8 | 3 | 29 | 36 | 40 | 0.81x | 0.74x |
-
-> GPU overhead dominates at this size. All configs slower than CPU.
-
-#### n=20 (1M coefficients)
-
-| fold | rate | CPU (ms) | GPU (ms) | Fused (ms) | GPU | Fused |
-|------|------|----------|----------|------------|-----|-------|
-| 4 | 1 | 53 | 55 | 59 | 0.97x | 0.90x |
-| 4 | 2 | 87 | 92 | 78 | 0.94x | **1.11x** |
-| 4 | 3 | 186 | 196 | 143 | 0.95x | **1.30x** |
-| 6 | 1 | 47 | 49 | 50 | 0.96x | 0.93x |
-| 6 | 2 | 114 | 92 | 108 | **1.23x** | 1.05x |
-| 6 | 3 | 611 | 439 | 516 | **1.39x** | **1.18x** |
-| 8 | 1 | 26 | 32 | 34 | 0.83x | 0.78x |
-| 8 | 2 | 52 | 45 | 48 | **1.16x** | 1.08x |
-| 8 | 3 | 100 | 86 | 83 | **1.16x** | **1.20x** |
-
-> GPU starts winning at rate=2-3. Crossover around 50-100 ms CPU time.
-
-#### n=22 (4M coefficients)
-
-| fold | rate | CPU (ms) | GPU (ms) | Fused (ms) | GPU | Fused |
-|------|------|----------|----------|------------|-----|-------|
-| 4 | 1 | 192 | 153 | 132 | **1.26x** | **1.45x** |
-| 4 | 2 | 354 | 256 | 232 | **1.38x** | **1.53x** |
-| 4 | 3 | 780 | 656 | 687 | **1.19x** | **1.13x** |
-| 6 | 1 | 168 | fail | 134 | - | **1.25x** |
-| **6** | **2** | **678** | **424** | **361** | **1.60x** | **1.88x** |
-| 6 | 3 | 2575 | 1767 | 2381 | **1.46x** | 1.08x |
-| 8 | 1 | 95 | 71 | 73 | **1.34x** | **1.30x** |
-| 8 | 2 | 193 | 182 | 161 | 1.06x | **1.19x** |
-| 8 | 3 | 465 | 344 | 321 | **1.35x** | **1.45x** |
-
-> Best result: **1.88x** at fold=6, rate=2.
-
-#### n=24 (16M coefficients)
-
-| fold | rate | CPU (ms) | GPU (ms) | Fused (ms) | GPU | Fused |
-|------|------|----------|----------|------------|-----|-------|
-| 4 | 1 | 992 | fail | 970 | - | 1.02x |
-| 6 | 1 | 663 | 515 | 526 | **1.29x** | **1.26x** |
-
-> Limited by GPU domain cap (2^25). Higher rates/folds push domain beyond safe limit.
+| n  | fold | rate | CPU (ms) | GPU (ms) | FUSED (ms) | GRIND (ms) | Speedup |
+|----|------|------|----------|----------|------------|------------|---------|
+| 20 | 1    | 1    | 302.9    | 219.6    | 189.6      | 185.7      | **1.63x** |
+| 20 | 2    | 2    | 212.8    | 148.1    | 132.7      | 133.3      | **1.60x** |
+| 20 | 4    | 3    | 180.9    | 143.5    | 138.1      | 138.2      | **1.31x** |
+| 22 | 1    | 1    | 1134.9   | 766.2    | 671.6      | 675.7      | **1.69x** |
+| 22 | 1    | 2    | 2035.6   | 1163.7   | 1052.4     | 1058.4     | **1.93x** |
+| 22 | 2    | 1    | 440.2    | 297.6    | 268.7      | 287.0      | **1.64x** |
+| 22 | 3    | 2    | 394.3    | 267.2    | 269.9      | 259.6      | **1.52x** |
+| 22 | 4    | 3    | 733.4    | 556.4    | 541.6      | 614.8      | **1.35x** |
+| 22 | 6    | 2    | 379.2    | 392.7    | 344.1      | 490.9      | **1.10x** |
+| 24 | 1    | 1    | 4772.7   | 2965.9   | 2509.8     | 2429.9     | **1.96x** |
+| 24 | 2    | 1    | 1860.6   | 1244.7   | 1084.8     | 1063.3     | **1.75x** |
+| 24 | 3    | 1    | 840.2    | 611.9    | 538.2      | 536.6      | **1.57x** |
+| 24 | 4    | 1    | 889.7    | 803.5    | 753.8      | 760.2      | **1.18x** |
+| 24 | 6    | 1    | 582.3    | 457.1    | 405.3      | 439.4      | **1.44x** |
 
 #### Summary
 
-| n | Best speedup | Config |
-|---|-------------|--------|
-| 18 | < 1x | GPU overhead dominates |
-| 20 | **1.39x** | fold=6, rate=3 |
-| 22 | **1.88x** | fold=6, rate=2 |
-| 24 | **1.29x** | fold=6, rate=1 |
+| n  | Best speedup | Config           |
+|----|-------------|------------------|
+| 20 | **1.63x**   | fold=1, rate=1   |
+| 22 | **1.93x**   | fold=1, rate=2   |
+| 24 | **1.96x**   | fold=1, rate=1   |
+
+GPU is faster than CPU for **all tested configurations** at n >= 20.
+Best speedups at low fold values where NTT dominates.
 
 #### Running benchmarks
 
