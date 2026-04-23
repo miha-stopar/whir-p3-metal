@@ -1412,6 +1412,105 @@ kernel void bb_dif_r32(
         data[(base + i * h) * width + col] = e[i];
 }
 
+// DIF R32 out-of-place: reads from src, writes to dst at the same indices.
+kernel void bb_dif_r32_oop(
+    device const Bb* src           [[buffer(0)]],
+    device Bb* dst                 [[buffer(1)]],
+    device const Bb* twiddles      [[buffer(2)]],
+    constant uint& height          [[buffer(3)]],
+    constant uint& width           [[buffer(4)]],
+    constant uint& dif_stage       [[buffer(5)]],
+    uint2 gid                      [[thread_position_in_grid]]
+) {
+    uint col = gid.x;
+    uint unit_id = gid.y;
+    uint num_units = height >> 5;
+    if (unit_id >= num_units || col >= width) return;
+
+    uint h = height >> (dif_stage + 5);
+    uint block_r32 = h << 5;
+    uint group = unit_id / h;
+    uint j = unit_id % h;
+    uint base = group * block_r32 + j;
+
+    Bb e[32];
+    for (uint i = 0; i < 32; i++)
+        e[i] = src[(base + i * h) * width + col];
+
+    uint step_s = 1u << dif_stage;
+
+    {
+        uint spacing = height >> 5;
+        for (uint k = 0; k < 16; k++) {
+            uint tw_idx = j * step_s + k * spacing;
+            Bb sum = bb_add(e[k], e[k + 16]);
+            Bb diff = bb_sub(e[k], e[k + 16]);
+            e[k] = sum;
+            e[k + 16] = (tw_idx == 0) ? diff : bb_mul(twiddles[tw_idx], diff);
+        }
+    }
+
+    {
+        uint step_s1 = step_s << 1;
+        uint spacing = height >> 4;
+        for (uint hh = 0; hh < 2; hh++) {
+            uint off = hh * 16;
+            for (uint k = 0; k < 8; k++) {
+                uint tw_idx = j * step_s1 + k * spacing;
+                Bb sum = bb_add(e[off + k], e[off + k + 8]);
+                Bb diff = bb_sub(e[off + k], e[off + k + 8]);
+                e[off + k] = sum;
+                e[off + k + 8] = (tw_idx == 0) ? diff : bb_mul(twiddles[tw_idx], diff);
+            }
+        }
+    }
+
+    {
+        uint step_s2 = step_s << 2;
+        uint spacing = height >> 3;
+        for (uint q = 0; q < 4; q++) {
+            uint off = q * 8;
+            for (uint k = 0; k < 4; k++) {
+                uint tw_idx = j * step_s2 + k * spacing;
+                Bb sum = bb_add(e[off + k], e[off + k + 4]);
+                Bb diff = bb_sub(e[off + k], e[off + k + 4]);
+                e[off + k] = sum;
+                e[off + k + 4] = (tw_idx == 0) ? diff : bb_mul(twiddles[tw_idx], diff);
+            }
+        }
+    }
+
+    {
+        uint step_s3 = step_s << 3;
+        uint spacing = height >> 2;
+        for (uint o = 0; o < 8; o++) {
+            uint off = o * 4;
+            for (uint k = 0; k < 2; k++) {
+                uint tw_idx = j * step_s3 + k * spacing;
+                Bb sum = bb_add(e[off + k], e[off + k + 2]);
+                Bb diff = bb_sub(e[off + k], e[off + k + 2]);
+                e[off + k] = sum;
+                e[off + k + 2] = (tw_idx == 0) ? diff : bb_mul(twiddles[tw_idx], diff);
+            }
+        }
+    }
+
+    {
+        uint step_s4 = step_s << 4;
+        uint tw_idx = j * step_s4;
+        for (uint p = 0; p < 16; p++) {
+            uint off = p * 2;
+            Bb sum = bb_add(e[off], e[off + 1]);
+            Bb diff = bb_sub(e[off], e[off + 1]);
+            e[off] = sum;
+            e[off + 1] = (tw_idx == 0) ? diff : bb_mul(twiddles[tw_idx], diff);
+        }
+    }
+
+    for (uint i = 0; i < 32; i++)
+        dst[(base + i * h) * width + col] = e[i];
+}
+
 // DIF R32 + fused bit-reversal (out-of-place).
 kernel void bb_dif_r32_bitrev(
     device const Bb* src           [[buffer(0)]],
@@ -2129,6 +2228,39 @@ kernel void bb_transpose_pad(
         uint src_base = (out_col * in_cols + out_row) * elem_size;
         for (uint d = 0; d < elem_size; d++) {
             dst[dst_base + d] = src[src_base + d];
+        }
+    } else {
+        for (uint d = 0; d < elem_size; d++) {
+            dst[dst_base + d] = Bb{0};
+        }
+    }
+}
+
+// Variant of bb_transpose_pad that reads from NEON packed (SoA) layout.
+// In packed form, 4 EF values share a block of elem_size*4 Bb values:
+//   block[comp * 4 + lane] = EF[lane].component[comp]
+// The output is identical to bb_transpose_pad (AoS layout, transposed).
+kernel void bb_transpose_pad_packed(
+    device const Bb* src       [[buffer(0)]],
+    device Bb* dst             [[buffer(1)]],
+    constant uint& in_rows     [[buffer(2)]],
+    constant uint& in_cols     [[buffer(3)]],
+    constant uint& out_rows    [[buffer(4)]],
+    constant uint& elem_size   [[buffer(5)]],
+    uint2 gid                  [[thread_position_in_grid]]
+) {
+    uint out_col = gid.x;
+    uint out_row = gid.y;
+    if (out_col >= in_rows || out_row >= out_rows) return;
+
+    uint dst_base = (out_row * in_rows + out_col) * elem_size;
+
+    if (out_row < in_cols) {
+        uint ef_idx = out_col * in_cols + out_row;
+        uint pack_base = (ef_idx >> 2) * (elem_size << 2);
+        uint lane = ef_idx & 3;
+        for (uint d = 0; d < elem_size; d++) {
+            dst[dst_base + d] = src[pack_base + d * 4 + lane];
         }
     } else {
         for (uint d = 0; d < elem_size; d++) {

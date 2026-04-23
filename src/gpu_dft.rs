@@ -101,6 +101,27 @@ pub trait DftCommitFusion<F: Field>: Mmcs<F> {
     {
         None
     }
+
+    /// Fused transpose + pad + DFT + commit for extension field, reading from
+    /// packed (NEON SoA) layout directly to avoid the `evals()` unpack.
+    /// `packed_data` is the raw u32 representation of `&[EF::ExtensionPacking]`.
+    /// `num_ef` is the number of EF elements (= packed count * packing width).
+    fn transpose_pad_dft_algebra_and_commit_packed<EF>(
+        &self,
+        _packed_data: &[u32],
+        _num_ef: usize,
+        _in_rows: usize,
+        _in_cols: usize,
+        _padded_height: usize,
+    ) -> Option<(
+        Self::Commitment,
+        Self::ProverData<p3_matrix::extension::FlatMatrixView<F, EF, RowMajorMatrix<EF>>>,
+    )>
+    where
+        EF: p3_field::ExtensionField<F> + BasedVectorSpace<F> + Clone + Send + Sync,
+    {
+        None
+    }
 }
 
 /// Build the Poseidon2 BabyBear width-16 constants buffer (143 Montgomery u32s)
@@ -263,6 +284,7 @@ pub struct MetalInner {
     queue: metal::CommandQueue,
     bitrev_ps: ComputePipelineState,
     bitrev_gather_ps: ComputePipelineState,
+    dif_r32_oop_ps: ComputePipelineState,
     dif_r16_oop_ps: ComputePipelineState,
     butterfly_ps: ComputePipelineState,
     butterfly_r4_ps: ComputePipelineState,
@@ -301,6 +323,7 @@ pub struct MetalInner {
     poseidon2_pow_grind_ps: ComputePipelineState,
     combine_select_ps: ComputePipelineState,
     transpose_pad_ps: ComputePipelineState,
+    transpose_pad_packed_ps: ComputePipelineState,
     poseidon2_rc_buf: Buffer,
     buf_copy_ps: ComputePipelineState,
     pow_bufs: Mutex<PowBuffers>,
@@ -492,6 +515,7 @@ impl MetalBabyBearDft {
 
         let bitrev_ps = make_ps("bb_ntt_bitrev");
         let bitrev_gather_ps = make_ps("bb_bitrev_gather");
+        let dif_r32_oop_ps = make_ps("bb_dif_r32_oop");
         let dif_r16_oop_ps = make_ps("bb_dif_r16_oop");
         let butterfly_ps = make_ps("bb_ntt_butterfly");
         let butterfly_r4_ps = make_ps("bb_ntt_butterfly_r4");
@@ -523,6 +547,7 @@ impl MetalBabyBearDft {
         let poseidon2_pow_grind_ps = make_ps("poseidon2_pow_grind");
         let combine_select_ps = make_ps("bb_combine_select");
         let transpose_pad_ps = make_ps("bb_transpose_pad");
+        let transpose_pad_packed_ps = make_ps("bb_transpose_pad_packed");
         let buf_copy_ps = make_ps("bb_buf_copy");
 
         let pow_tg_size = (poseidon2_pow_grind_ps.max_total_threads_per_threadgroup() as u64)
@@ -566,6 +591,7 @@ impl MetalBabyBearDft {
             queue,
             bitrev_ps,
             bitrev_gather_ps,
+            dif_r32_oop_ps,
             dif_r16_oop_ps,
             butterfly_ps,
             butterfly_r4_ps,
@@ -603,6 +629,7 @@ impl MetalBabyBearDft {
             poseidon2_pow_grind_ps,
             combine_select_ps,
             transpose_pad_ps,
+            transpose_pad_packed_ps,
             poseidon2_rc_buf,
             buf_copy_ps,
             pow_bufs: Mutex::new(pow_bufs),
@@ -1310,6 +1337,33 @@ impl MetalBabyBearDft {
         out_height: usize,
         elem_size: usize,
     ) -> Option<(Vec<BabyBear>, GpuMerkleResult)> {
+        self.gpu_transpose_dft_and_merkle_inner(data.as_ptr(), data.len(), in_rows, in_cols, out_height, elem_size, false)
+    }
+
+    /// Like `gpu_transpose_dft_and_merkle` but input is in NEON packed (SoA) layout.
+    /// Each block of `elem_size * 4` elements stores 4 EF values in SoA form.
+    pub fn gpu_transpose_dft_and_merkle_packed(
+        &self,
+        data_ptr: *const BabyBear,
+        data_len: usize,
+        in_rows: usize,
+        in_cols: usize,
+        out_height: usize,
+        elem_size: usize,
+    ) -> Option<(Vec<BabyBear>, GpuMerkleResult)> {
+        self.gpu_transpose_dft_and_merkle_inner(data_ptr, data_len, in_rows, in_cols, out_height, elem_size, true)
+    }
+
+    fn gpu_transpose_dft_and_merkle_inner(
+        &self,
+        data_ptr: *const BabyBear,
+        data_len: usize,
+        in_rows: usize,
+        in_cols: usize,
+        out_height: usize,
+        elem_size: usize,
+        packed_input: bool,
+    ) -> Option<(Vec<BabyBear>, GpuMerkleResult)> {
         let out_width = in_rows * elem_size;
         let total_out = out_height * out_width;
         let log_n = log2_strict_usize(out_height) as u32;
@@ -1328,28 +1382,33 @@ impl MetalBabyBearDft {
         let dif_buf = Self::acquire_buf(&self.data_buf_cache, &self.device, total_bytes);
         let natural_buf = Self::acquire_buf(&self.temp_buf_cache, &self.device, total_bytes);
 
-        let src_bytes = (data.len() * size_of::<u32>()) as u64;
+        let src_bytes = (data_len * size_of::<u32>()) as u64;
         let opts = MTLResourceOptions::CPUCacheModeDefaultCache
             | MTLResourceOptions::StorageModeShared;
-        let src_buf = Self::make_source_buffer(&self.device, data.as_ptr(), src_bytes, opts);
+        let src_buf = Self::make_source_buffer(&self.device, data_ptr, src_bytes, opts);
 
         let use_four_step = self.use_four_step(log_n);
 
         let profiling = std::env::var("GPU_PROFILE").is_ok();
 
         let gpu_result: Option<(MerkleLayers, Vec<BabyBear>, Option<bool>)> = autoreleasepool(|| {
+            let transpose_ps = if packed_input {
+                &self.transpose_pad_packed_ps
+            } else {
+                &self.transpose_pad_ps
+            };
             let encode_transpose = |enc: &ComputeCommandEncoderRef| {
                 let set_u32 = |enc: &ComputeCommandEncoderRef, index: u64, val: u32| {
                     enc.set_bytes(index, size_of::<u32>() as u64, (&val as *const u32).cast());
                 };
-                enc.set_compute_pipeline_state(&self.transpose_pad_ps);
+                enc.set_compute_pipeline_state(transpose_ps);
                 enc.set_buffer(0, Some(&src_buf), 0);
                 enc.set_buffer(1, Some(&dif_buf), 0);
                 set_u32(enc, 2, in_rows as u32);
                 set_u32(enc, 3, in_cols as u32);
                 set_u32(enc, 4, out_height as u32);
                 set_u32(enc, 5, elem_size as u32);
-                let tg = self.transpose_pad_ps.max_total_threads_per_threadgroup() as u64;
+                let tg = transpose_ps.max_total_threads_per_threadgroup() as u64;
                 let tg_w = (in_rows as u64).min(16);
                 let tg_h = (tg / tg_w).min(64);
                 enc.dispatch_threads(
@@ -1514,7 +1573,31 @@ impl MetalBabyBearDft {
 
         while dif_stage < log_n {
             let gap = log_n - dif_stage;
-            if gap >= 4 {
+            if gap >= 5 {
+                let num_units = height >> 5;
+                if first_dispatch {
+                    let max_tg = self.dif_r32_oop_ps.max_total_threads_per_threadgroup() as u32;
+                    enc.set_compute_pipeline_state(&self.dif_r32_oop_ps);
+                    enc.set_buffer(0, Some(zc_buf), 0);
+                    enc.set_buffer(1, Some(data), 0);
+                    enc.set_buffer(2, Some(twiddles), 0);
+                    set_u32(enc, 3, height);
+                    set_u32(enc, 4, width);
+                    set_u32(enc, 5, dif_stage);
+                    enc.dispatch_threads(
+                        MTLSize { width: width as u64, height: num_units as u64, depth: 1 },
+                        MTLSize {
+                            width: tg_w as u64,
+                            height: (max_tg / tg_w).min(num_units) as u64,
+                            depth: 1,
+                        },
+                    );
+                    first_dispatch = false;
+                } else {
+                    self.dispatch_dif_inplace(enc, data, twiddles, height, width, dif_stage, tg_w, &self.dif_r32_ps, 5);
+                }
+                dif_stage += 5;
+            } else if gap >= 4 {
                 let num_units = height >> 4;
                 if first_dispatch {
                     let max_tg = self.dif_r16_oop_ps.max_total_threads_per_threadgroup() as u32;
@@ -1535,21 +1618,7 @@ impl MetalBabyBearDft {
                     );
                     first_dispatch = false;
                 } else {
-                    let max_tg = self.dif_r16_ps.max_total_threads_per_threadgroup() as u32;
-                    enc.set_compute_pipeline_state(&self.dif_r16_ps);
-                    enc.set_buffer(0, Some(data), 0);
-                    enc.set_buffer(1, Some(twiddles), 0);
-                    set_u32(enc, 2, height);
-                    set_u32(enc, 3, width);
-                    set_u32(enc, 4, dif_stage);
-                    enc.dispatch_threads(
-                        MTLSize { width: width as u64, height: num_units as u64, depth: 1 },
-                        MTLSize {
-                            width: tg_w as u64,
-                            height: (max_tg / tg_w).min(num_units) as u64,
-                            depth: 1,
-                        },
-                    );
+                    self.dispatch_dif_inplace(enc, data, twiddles, height, width, dif_stage, tg_w, &self.dif_r16_ps, 4);
                 }
                 dif_stage += 4;
             } else if gap >= 3 {
@@ -1575,31 +1644,16 @@ impl MetalBabyBearDft {
         height: u32,
         width: u32,
     ) {
-        let set_u32 = |enc: &ComputeCommandEncoderRef, index: u64, val: u32| {
-            enc.set_bytes(index, size_of::<u32>() as u64, (&val as *const u32).cast());
-        };
         let tg_w = width.min(32);
         let mut dif_stage = 0u32;
 
         while dif_stage < log_n {
             let gap = log_n - dif_stage;
-            if gap >= 4 {
-                let num_units = height >> 4;
-                let max_tg = self.dif_r16_ps.max_total_threads_per_threadgroup() as u32;
-                enc.set_compute_pipeline_state(&self.dif_r16_ps);
-                enc.set_buffer(0, Some(data), 0);
-                enc.set_buffer(1, Some(twiddles), 0);
-                set_u32(enc, 2, height);
-                set_u32(enc, 3, width);
-                set_u32(enc, 4, dif_stage);
-                enc.dispatch_threads(
-                    MTLSize { width: width as u64, height: num_units as u64, depth: 1 },
-                    MTLSize {
-                        width: tg_w as u64,
-                        height: (max_tg / tg_w).min(num_units) as u64,
-                        depth: 1,
-                    },
-                );
+            if gap >= 5 {
+                self.dispatch_dif_inplace(enc, data, twiddles, height, width, dif_stage, tg_w, &self.dif_r32_ps, 5);
+                dif_stage += 5;
+            } else if gap >= 4 {
+                self.dispatch_dif_inplace(enc, data, twiddles, height, width, dif_stage, tg_w, &self.dif_r16_ps, 4);
                 dif_stage += 4;
             } else if gap >= 3 {
                 self.dispatch_dif_inplace(enc, data, twiddles, height, width, dif_stage, tg_w, &self.dif_r8_ps, 3);
@@ -2350,7 +2404,10 @@ impl MetalBabyBearDft {
 
         while dif_stage < global_stages {
             let gap = global_stages - dif_stage;
-            if gap >= 4 {
+            if gap >= 5 {
+                self.dispatch_dif_inplace(enc, data, twiddles, height, width, dif_stage, tg_w, &self.dif_r32_ps, 5);
+                dif_stage += 5;
+            } else if gap >= 4 {
                 let num_units = height >> 4;
                 let max_tg = self.dif_r16_ps.max_total_threads_per_threadgroup() as u32;
                 enc.set_compute_pipeline_state(&self.dif_r16_ps);
@@ -3030,6 +3087,38 @@ where
         };
         let (values, result) =
             self.gpu.gpu_transpose_dft_and_merkle(base_data, in_rows, in_cols, padded_height, d)?;
+        let ef_values = {
+            let (len, cap) = (values.len(), values.capacity());
+            let p = values.as_ptr() as *mut EF;
+            std::mem::forget(values);
+            unsafe { Vec::from_raw_parts(p, len / d, cap / d) }
+        };
+        let ef_mat = RowMajorMatrix::new(ef_values, in_rows);
+        let flat_view = p3_matrix::extension::FlatMatrixView::new(ef_mat);
+        Some(result.into_tree_zc(vec![flat_view]))
+    }
+
+    fn transpose_pad_dft_algebra_and_commit_packed<EF>(
+        &self,
+        packed_data: &[u32],
+        num_ef: usize,
+        in_rows: usize,
+        in_cols: usize,
+        padded_height: usize,
+    ) -> Option<(
+        Self::Commitment,
+        Self::ProverData<p3_matrix::extension::FlatMatrixView<BabyBear, EF, RowMajorMatrix<EF>>>,
+    )>
+    where
+        EF: p3_field::ExtensionField<BabyBear> + BasedVectorSpace<BabyBear> + Clone + Send + Sync,
+    {
+        let d = EF::DIMENSION;
+        assert_eq!(packed_data.len(), num_ef * d);
+        let (values, result) = self.gpu.gpu_transpose_dft_and_merkle_packed(
+            packed_data.as_ptr().cast(),
+            packed_data.len(),
+            in_rows, in_cols, padded_height, d,
+        )?;
         let ef_values = {
             let (len, cap) = (values.len(), values.capacity());
             let p = values.as_ptr() as *mut EF;

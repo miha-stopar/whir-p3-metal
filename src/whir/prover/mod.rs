@@ -474,9 +474,7 @@ where
     where
         Challenger: CanObserve<MT::Commitment>,
     {
-        let folded_evaluations = &round_state.sumcheck_prover.evals();
         let num_variables = self.num_variables - self.folding_factor.total_number(round_index);
-        assert_eq!(num_variables, folded_evaluations.num_vars());
 
         if round_index == self.n_rounds() {
             return self.final_round(round_index, proof, challenger, round_state);
@@ -486,12 +484,39 @@ where
         let folding_factor_next = self.folding_factor.at_round(round_index + 1);
         let inv_rate = self.inv_rate(round_index);
 
-        let num_vars = folded_evaluations.num_vars();
-        let in_cols_ef = 1 << (num_vars - folding_factor_next);
+        let in_cols_ef = 1 << (num_variables - folding_factor_next);
         let in_rows_ef = 1 << folding_factor_next;
         let padded_height = inv_rate * in_cols_ef;
 
-        let (root, prover_data) =
+        // Try packed path first: read directly from NEON SoA layout, skip evals() unpack
+        let packed_result: Option<(_, _)> =
+            if let ProductPolynomial::Packed { ref evals, .. } = round_state.sumcheck_prover.poly {
+                let packed_slice = evals.as_slice();
+                let pack_bytes = core::mem::size_of_val(packed_slice);
+                let pack_u32s = pack_bytes / core::mem::size_of::<u32>();
+                let packed_data: &[u32] = unsafe {
+                    core::slice::from_raw_parts(packed_slice.as_ptr().cast(), pack_u32s)
+                };
+                let pack_width =
+                    core::mem::size_of::<EF::ExtensionPacking>() / core::mem::size_of::<EF>();
+                let num_ef = packed_slice.len() * pack_width;
+                debug_assert_eq!(num_ef, 1 << num_variables);
+                info_span!("fused_transpose_dft_algebra_commit").in_scope(|| {
+                    self.mmcs.transpose_pad_dft_algebra_and_commit_packed::<EF>(
+                        packed_data, num_ef, in_rows_ef, in_cols_ef, padded_height,
+                    )
+                })
+            } else {
+                None
+            };
+
+        let (root, prover_data) = if let Some(result) = packed_result {
+            result
+        } else {
+            let folded_evaluations =
+                info_span!("evals").in_scope(|| round_state.sumcheck_prover.evals());
+            assert_eq!(num_variables, folded_evaluations.num_vars());
+
             if let Some(result) = info_span!("fused_transpose_dft_algebra_commit").in_scope(|| {
                 self.mmcs.transpose_pad_dft_algebra_and_commit(
                     folded_evaluations.as_slice(), in_rows_ef, in_cols_ef, padded_height,
@@ -519,9 +544,10 @@ where
                         let extension_mmcs = ExtensionMmcs::new(self.mmcs.clone());
                         info_span!("commit matrix")
                             .in_scope(|| extension_mmcs.commit_matrix(folded_matrix))
-                        }
+                    }
                 }
-            };
+            }
+        };
 
         let extension_mmcs = ExtensionMmcs::new(self.mmcs.clone());
 

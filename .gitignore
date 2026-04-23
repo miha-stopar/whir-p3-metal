@@ -29,3 +29,8 @@ proptest-regressions/
 
 # Profile data
 profile.json
+
+# iOS build artifacts
+ios/lib/
+ios/WhirBench.xcodeproj/
+bench_results_*.txt

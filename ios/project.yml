@@ -1,0 +1,27 @@
+name: WhirBench
+options:
+  bundleIdPrefix: com.whir
+  deploymentTarget:
+    iOS: "16.0"
+
+targets:
+  WhirBench:
+    type: application
+    platform: iOS
+    sources:
+      - WhirBench
+    settings:
+      base:
+        SWIFT_OBJC_BRIDGING_HEADER: WhirBench/WhirBench-Bridging-Header.h
+        HEADER_SEARCH_PATHS: $(SRCROOT)
+        LIBRARY_SEARCH_PATHS:
+          - $(SRCROOT)/lib/WhirBench.xcframework/ios-arm64
+          - $(SRCROOT)/lib/WhirBench.xcframework/ios-arm64-simulator
+          - $(SRCROOT)/lib
+        OTHER_LDFLAGS:
+          - -lwhir_p3
+          - -framework Metal
+          - -framework MetalKit
+          - -lc++
+          - -lresolv
+    dependencies: []

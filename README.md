@@ -156,13 +156,64 @@ All benchmarks on Apple M-series silicon (unified memory). Best of 3 runs
 #### Running benchmarks
 
 ```bash
-# Full whir_prove benchmark (default config: n=24, fold=4, rate=1)
-cargo bench --features gpu-metal --bench dft_gpu -- "whir_prove"
+# Quick benchmark (focused configs, 3 runs each, ~10 min)
+./bench.sh
 
-# Parameter sweep comparing CPU / GPU / GPU+fused rounds
-# (writes results to sweep_results.txt)
-cargo run --release --features gpu-metal --bin sweep
+# Full sweep (all configs, 3 runs each, ~60 min)
+./bench.sh --full
+
+# Fewer/more runs per config
+./bench.sh --runs 5
+./bench.sh --runs 1 22 1 1  # single config, 1 run (fast)
+
+# Or run the sweep binary directly:
+cargo run --release --features gpu-metal,cli --bin sweep
 ```
 
-For a detailed optimization log with diagrams showing each step, see
+Each config is run N times (default 3) and the **median** is reported, which
+reduces variance from PoW nonce search and system noise.
+
+#### Benchmarking on another Mac
+
+Any Mac with Apple Silicon (M1/M2/M3/M4) works:
+
+```bash
+# 1. Install Rust nightly
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --default-toolchain nightly -y
+source "$HOME/.cargo/env"
+
+# 2. Clone and run
+git clone https://github.com/miha-stopar/whir-p3-metal.git
+cd whir-p3-metal
+./bench.sh
+```
+
+The script prints system info (chip model, macOS version) and saves results to a
+timestamped file. Share the file to compare GPU/CPU ratios across machines.
+
+**Prerequisites**: Rust nightly toolchain + Xcode Command Line Tools
+(`xcode-select --install`).
+
+#### Benchmarking on iPhone (iOS)
+
+A SwiftUI benchmark app is included in `ios/`. It calls the same prover code
+via C FFI, so CPU vs GPU comparisons are apples-to-apples.
+
+```bash
+cd ios
+
+# 1. Build Rust static library for iOS device + simulator
+./build-rust.sh
+
+# 2. Generate Xcode project (requires: brew install xcodegen)
+xcodegen
+
+# 3. Open in Xcode, select your iPhone, and press Cmd+R
+open WhirBench.xcodeproj
+```
+
+See [`ios/README.md`](ios/README.md) for prerequisites and manual setup
+without xcodegen.
+
+For a detailed optimization log, see
 [`docs/gpu-optimizations.md`](docs/gpu-optimizations.md).
