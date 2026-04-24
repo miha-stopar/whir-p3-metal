@@ -2,7 +2,7 @@
 
 ## TL;DR
 
-We accelerated the [WHIR](https://eprint.iacr.org/2024/1586) prover on Apple Silicon GPUs using Metal compute shaders, achieving **up to 2.03x speedup** over highly optimized CPU code (SIMD + LTO + `target-cpu=native`) on an M1 chip. The GPU pipeline fuses NTT (Number Theoretic Transform), bit-reversal, Poseidon2 Merkle tree hashing, and proof-of-work grinding into single command buffer submissions, exploiting Apple Silicon's unified memory architecture. The implementation is open source and runs on any Mac with Apple Silicon, with an iOS benchmark app for iPhone testing.
+We accelerated the [WHIR](https://eprint.iacr.org/2024/1586) prover on Apple Silicon GPUs using Metal compute shaders, achieving **up to 2.03x speedup** over highly optimized CPU code (SIMD + LTO + `target-cpu=native`) on an M1 chip. The GPU pipeline fuses NTT (Number Theoretic Transform), bit-reversal, Poseidon2 Merkle tree hashing, and proof-of-work grinding into single command buffer submissions, exploiting Apple Silicon's unified memory architecture. It runs on any Mac with Apple Silicon, with an iOS benchmark app for iPhone testing.
 
 **Key findings:**
 
@@ -368,7 +368,7 @@ In practice, this was **20% slower** than our flat DIF approach because:
 
 | Project                | Target         | Protocol       | Speedup             | Field             | API    | Source                                                                                                        |
 | ---------------------- | -------------- | -------------- | ------------------- | ----------------- | ------ | ------------------------------------------------------------------------------------------------------------- |
-| **This work**          | Apple M1 GPU   | WHIR/Poseidon2 | **1.3-2.0x** vs CPU | BabyBear (31-bit) | Metal  | [repo](https://github.com/privacy-ethereum/whir-p3-metal)                                                          |
+| **This work**          | Apple M1 GPU   | WHIR/Poseidon2 | **1.3-2.0x** vs CPU | BabyBear (31-bit) | Metal  | [repo](https://github.com/privacy-ethereum/whir-p3-metal)                                                     |
 | Mopro Metal MSM v2     | Apple GPU      | MSM (BN254)    | 40-100x vs v1       | BN254 (254-bit)   | Metal  | [write-up](https://zkmopro.org/blog/metal-msm-v2/), [code](https://github.com/zkmopro/gpu-acceleration)       |
 | ICICLE Metal v3.6      | Apple GPU      | MSM, NTT       | up to 5x            | Multiple          | Metal  | [blog](https://medium.com/@ingonyama/icicle-goes-metal-v3-6-163fa7bbfa44), [docs](https://dev.ingonyama.com/) |
 | ICICLE-Stwo (CUDA)     | Datacenter GPU | Circle STARK   | 3.25-7x vs CPU SIMD | M31 (31-bit)      | CUDA   | [blog](https://medium.com/@ingonyama/introducing-icicle-stwo-a-gpu-accelerated-stwo-prover-550b413d4f88)      |
@@ -408,11 +408,7 @@ The sumcheck protocol is the main remaining CPU bottleneck (~15% of runtime). Wh
 
 ## 10. Reproducibility
 
-The implementation in this repository is open source.
-
 Based on [tcoratger/whir-p3](https://github.com/tcoratger/whir-p3) (WHIR implementation using [Plonky3](https://github.com/Plonky3/Plonky3)).
-
-Cross-references between Markdown files under `docs/` use **relative paths** (for example [`gpu-optimizations.md`](gpu-optimizations.md)) so on GitHub they stay on the same fork or org you are viewing.
 
 ### Running on Mac
 
@@ -421,7 +417,7 @@ Cross-references between Markdown files under `docs/` use **relative paths** (fo
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --default-toolchain nightly -y
 source "$HOME/.cargo/env"
 
-# Clone and benchmark (use your repository’s HTTPS URL from GitHub’s Code button)
+# Clone and benchmark
 git clone https://github.com/privacy-ethereum/whir-p3-metal.git
 cd whir-p3-metal
 ./bench.sh           # ~15 min, saves results to bench_results_<timestamp>.txt
