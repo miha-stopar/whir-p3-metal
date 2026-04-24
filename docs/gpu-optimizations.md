@@ -1746,7 +1746,7 @@ cancellation signal to stop the slower searcher once the faster one finds a witn
 2. `**gpu_pow_grind_cancellable`** — Like `gpu_pow_grind`, but checks the
   cancellation flag between Metal batch dispatches and signals it upon finding
    a winner.
-3. `**GpuChallenger::grind*`* — For `bits < 20`, delegates directly to the
+3. `**GpuChallenger::grind`** — For `bits < 20`, delegates directly to the
   CPU `DuplexChallenger::grind` (GPU dispatch overhead exceeds the PoW search
    time). For `bits >= 20`, spawns a CPU thread while running GPU grind on the
    main thread (Metal objects aren't `Send`). Whichever finds the witness first
@@ -2310,7 +2310,7 @@ Further GPU kernel optimization is not feasible without algorithmic changes
 
 ## Final benchmark (3-run median, Apple M1)
 
-**Date**: 2026-04-23
+**Date**: 2026-04-24
 **Rust**: rustc 1.97.0-nightly (9ec5d5f32 2026-04-21)
 **Host**: arm64 macOS 15.5, Apple M1
 **Runs**: 3 per config (median reported)
@@ -2318,32 +2318,62 @@ Further GPU kernel optimization is not feasible without algorithmic changes
 
 All times in milliseconds. **Speedup** = CPU / best GPU mode.
 
-| n  | fold | rate | CPU (ms) | GPU (ms) | FUSED (ms) | GRIND (ms) | Speedup |
-|----|------|------|----------|----------|------------|------------|---------|
-| 20 | 1    | 1    | 302.9    | 219.6    | 189.6      | 185.7      | **1.63x** |
-| 20 | 2    | 2    | 212.8    | 148.1    | 132.7      | 133.3      | **1.60x** |
-| 20 | 4    | 3    | 180.9    | 143.5    | 138.1      | 138.2      | **1.31x** |
-| 22 | 1    | 1    | 1134.9   | 766.2    | 671.6      | 675.7      | **1.69x** |
-| 22 | 1    | 2    | 2035.6   | 1163.7   | 1052.4     | 1058.4     | **1.93x** |
-| 22 | 2    | 1    | 440.2    | 297.6    | 268.7      | 287.0      | **1.64x** |
-| 22 | 3    | 2    | 394.3    | 267.2    | 269.9      | 259.6      | **1.52x** |
-| 22 | 4    | 3    | 733.4    | 556.4    | 541.6      | 614.8      | **1.35x** |
-| 22 | 6    | 2    | 379.2    | 392.7    | 344.1      | 490.9      | **1.10x** |
-| 24 | 1    | 1    | 4772.7   | 2965.9   | 2509.8     | 2429.9     | **1.96x** |
-| 24 | 2    | 1    | 1860.6   | 1244.7   | 1084.8     | 1063.3     | **1.75x** |
-| 24 | 3    | 1    | 840.2    | 611.9    | 538.2      | 536.6      | **1.57x** |
-| 24 | 4    | 1    | 889.7    | 803.5    | 753.8      | 760.2      | **1.18x** |
-| 24 | 6    | 1    | 582.3    | 457.1    | 405.3      | 439.4      | **1.44x** |
+#### n=20 (1M coefficients)
+
+| fold | rate | CPU (ms) | GPU (ms) | FUSED (ms) | GRIND (ms) | Speedup |
+|------|------|----------|----------|------------|------------|---------|
+| 1    | 1    | 266.8    | 190.5    | 179.4      | 171.1      | **1.56x** |
+| 1    | 2    | 453.2    | 301.9    | 292.2      | 289.7      | **1.56x** |
+| 1    | 3    | 897.4    | 527.5    | 482.5      | 483.2      | **1.86x** |
+| 2    | 1    | 126.7    | 85.9     | 74.6       | 77.8       | **1.70x** |
+| 2    | 2    | 216.8    | 128.9    | 121.6      | 123.8      | **1.78x** |
+| 2    | 3    | 414.4    | 231.3    | 228.4      | 209.7      | **1.98x** |
+| 4    | 1    | 49.0     | 40.5     | 34.7       | 35.0       | **1.41x** |
+| 4    | 2    | 89.4     | 61.8     | 52.6       | 56.1       | **1.70x** |
+| 4    | 3    | 199.5    | 130.6    | 119.6      | 131.4      | **1.67x** |
+
+#### n=22 (4M coefficients)
+
+| fold | rate | CPU (ms) | GPU (ms) | FUSED (ms) | GRIND (ms) | Speedup |
+|------|------|----------|----------|------------|------------|---------|
+| 1    | 1    | 1174.3   | 774.6    | 579.4      | 618.3      | **2.03x** |
+| 1    | 2    | 1937.6   | 1215.1   | 1092.1     | 1226.3     | **1.77x** |
+| 1    | 3    | 3459.3   | 2331.5   | 1940.0     | 1933.5     | **1.79x** |
+| 2    | 1    | 440.9    | 309.6    | 296.3      | 286.5      | **1.54x** |
+| 2    | 2    | 805.0    | 554.6    | 484.4      | 484.7      | **1.66x** |
+| 2    | 3    | 1675.8   | 966.3    | 902.1      | 897.1      | **1.87x** |
+| 3    | 1    | 206.0    | 150.8    | 139.3      | 138.3      | **1.49x** |
+| 3    | 2    | 381.4    | 269.3    | 248.1      | 255.9      | **1.54x** |
+| 3    | 3    | 896.7    | 651.5    | 611.3      | 670.4      | **1.47x** |
+| 4    | 1    | 165.9    | 128.1    | 132.4      | 144.3      | **1.30x** |
+| 4    | 2    | 321.8    | 226.7    | 215.9      | 214.6      | **1.50x** |
+| 4    | 3    | 661.0    | 530.4    | 567.4      | 618.1      | **1.25x** |
+| 6    | 1    | 141.2    | 124.5    | 98.1       | 100.4      | **1.44x** |
+| 6    | 2    | 410.2    | 326.9    | 357.3      | 472.9      | **1.25x** |
+| 6    | 3    | 1763.1   | 1753.4   | 1494.0     | 1320.1     | **1.34x** |
+
+#### n=24 (16M coefficients)
+
+| fold | rate | CPU (ms) | GPU (ms) | FUSED (ms) | GRIND (ms) | Speedup |
+|------|------|----------|----------|------------|------------|---------|
+| 1    | 1    | 4152.9   | 2809.0   | 2525.4     | 2462.5     | **1.69x** |
+| 2    | 1    | 1813.6   | 1287.0   | 1120.9     | 1049.4     | **1.73x** |
+| 3    | 1    | 890.1    | 623.0    | 540.8      | 530.7      | **1.68x** |
+| 4    | 1    | 977.7    | 756.8    | 693.8      | 706.1      | **1.41x** |
+| 6    | 1    | 587.5    | 445.1    | 405.0      | 412.1      | **1.45x** |
+
+> n=24 rate>=2 exceeds GPU domain cap (2^25 elements).
 
 ### Summary
 
-| n  | Best speedup | Config           | Notes                    |
-|----|-------------|------------------|--------------------------|
-| 20 | **1.63x**   | fold=1, rate=1   | GPU wins across all configs |
-| 22 | **1.93x**   | fold=1, rate=2   | Best at low fold, high rate |
-| 24 | **1.96x**   | fold=1, rate=1   | Largest workload, biggest gain |
+| n  | Best speedup | Config           |
+|----|-------------|------------------|
+| 20 | **1.98x**   | fold=2, rate=3   |
+| 22 | **2.03x**   | fold=1, rate=1   |
+| 24 | **1.73x**   | fold=2, rate=1   |
 
-- GPU is faster than CPU for **all tested configurations** at n >= 20.
-- Best speedups are at low fold values (fold=1-2) where NTT dominates.
-- Higher fold values (fold=4-6) reduce the NTT portion and shift work toward PoW, narrowing the gap.
-- FUSED and GRIND modes are generally faster than plain GPU mode due to avoiding CPU round-trips and GPU PoW grinding respectively.
+- GPU is faster than CPU for **all 29 tested configurations** at n >= 20.
+- Best speedups at low fold (1-2) and higher rate, where NTT + Merkle dominate.
+- Higher fold values shift work toward PoW and sumcheck, narrowing the gap.
+- FUSED and GRIND modes are generally fastest due to avoiding CPU round-trips.
+
