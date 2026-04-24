@@ -12,9 +12,9 @@ We accelerated the [WHIR](https://eprint.iacr.org/2024/1586) prover on Apple Sil
 - The Poseidon2 Merkle kernel is the dominant cost (~58% of GPU time). Xcode GPU profiler shows high ALU utilization and no obvious stalls, suggesting we are close to hardware limits for this workload, though Apple does not publish precise integer throughput specs to confirm.
 - Compiler optimizations (LTO, `target-cpu=native`) improved the CPU baseline by ~25%, making the GPU harder to beat but improving absolute end-to-end performance
 
-**Repository**: [github.com/miha-stopar/whir-p3-metal](https://github.com/miha-stopar/whir-p3-metal)
+**Canonical repository**: [github.com/privacy-ethereum/whir-p3-metal](https://github.com/privacy-ethereum/whir-p3-metal)
 
-Our work builds on [tcoratger/whir-p3](https://github.com/tcoratger/whir-p3), a Rust implementation of the WHIR protocol using the [Plonky3](https://github.com/Plonky3/Plonky3) library. We added Metal GPU acceleration to this codebase.
+Our work builds on [tcoratger/whir-p3](https://github.com/tcoratger/whir-p3), a Rust implementation of the WHIR protocol using the [Plonky3](https://github.com/Plonky3/Plonky3) library. We added Metal GPU acceleration to this codebase. (Lineage: [WizardOfMenlo/whir](https://github.com/WizardOfMenlo/whir) → [whir-p3](https://github.com/tcoratger/whir-p3) → **whir-p3-metal**.)
 
 ---
 
@@ -370,7 +370,7 @@ In practice, this was **20% slower** than our flat DIF approach because:
 
 | Project                | Target         | Protocol       | Speedup             | Field             | API    | Source                                                                                                        |
 | ---------------------- | -------------- | -------------- | ------------------- | ----------------- | ------ | ------------------------------------------------------------------------------------------------------------- |
-| **This work**          | Apple M1 GPU   | WHIR/Poseidon2 | **1.3-2.0x** vs CPU | BabyBear (31-bit) | Metal  | [repo](https://github.com/miha-stopar/whir-p3-metal)                                                          |
+| **This work**          | Apple M1 GPU   | WHIR/Poseidon2 | **1.3-2.0x** vs CPU | BabyBear (31-bit) | Metal  | [repo](https://github.com/privacy-ethereum/whir-p3-metal)                                                          |
 | Mopro Metal MSM v2     | Apple GPU      | MSM (BN254)    | 40-100x vs v1       | BN254 (254-bit)   | Metal  | [write-up](https://zkmopro.org/blog/metal-msm-v2/), [code](https://github.com/zkmopro/gpu-acceleration)       |
 | ICICLE Metal v3.6      | Apple GPU      | MSM, NTT       | up to 5x            | Multiple          | Metal  | [blog](https://medium.com/@ingonyama/icicle-goes-metal-v3-6-163fa7bbfa44), [docs](https://dev.ingonyama.com/) |
 | ICICLE-Stwo (CUDA)     | Datacenter GPU | Circle STARK   | 3.25-7x vs CPU SIMD | M31 (31-bit)      | CUDA   | [blog](https://medium.com/@ingonyama/introducing-icicle-stwo-a-gpu-accelerated-stwo-prover-550b413d4f88)      |
@@ -410,9 +410,11 @@ The sumcheck protocol is the main remaining CPU bottleneck (~15% of runtime). Wh
 
 ## 10. Reproducibility
 
-All code is open source: **[github.com/miha-stopar/whir-p3-metal](https://github.com/miha-stopar/whir-p3-metal)**
+All code is open source: **[github.com/privacy-ethereum/whir-p3-metal](https://github.com/privacy-ethereum/whir-p3-metal)**
 
 Based on [tcoratger/whir-p3](https://github.com/tcoratger/whir-p3) (WHIR implementation using [Plonky3](https://github.com/Plonky3/Plonky3)).
+
+Links between Markdown files under `docs/` use **relative paths** (for example [`gpu-optimizations.md`](gpu-optimizations.md)) so on GitHub they open the same fork or org you are viewing. Only the canonical clone URL below is fixed to `privacy-ethereum`; if you use a personal fork, replace it with your fork’s HTTPS URL from the green **Code** button.
 
 ### Running on Mac
 
@@ -422,7 +424,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --default-t
 source "$HOME/.cargo/env"
 
 # Clone and benchmark
-git clone https://github.com/miha-stopar/whir-p3-metal.git
+git clone https://github.com/privacy-ethereum/whir-p3-metal.git
 cd whir-p3-metal
 ./bench.sh           # ~15 min, saves results to bench_results_<timestamp>.txt
 ./bench.sh --full    # ~60 min, all configurations
@@ -439,4 +441,4 @@ open WhirBench.xcodeproj  # build and run on device
 
 ### Detailed optimization log
 
-See `[docs/gpu-optimizations.md](https://github.com/miha-stopar/whir-p3-metal/blob/main/docs/gpu-optimizations.md)` for a detailed log of all 30 optimization iterations with before/after benchmarks.
+See [gpu-optimizations.md](gpu-optimizations.md) for a detailed log of all 30 optimization iterations with before/after benchmarks.

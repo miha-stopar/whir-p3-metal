@@ -1,6 +1,20 @@
-# whir-p3
+# whir-p3-metal
 
-A version of https://github.com/WizardOfMenlo/whir/ which uses the Plonky3 library.
+Metal-accelerated WHIR proving on Apple Silicon (macOS / iOS). This repo is a
+**Metal GPU fork** of [tcoratger/whir-p3](https://github.com/tcoratger/whir-p3),
+which is *“A version of [WizardOfMenlo/whir](https://github.com/WizardOfMenlo/whir)
+which uses the [Plonky3](https://github.com/Plonky3/Plonky3) library.”* We keep
+the same protocol and Plonky3 integration, and add Metal compute for NTT,
+Poseidon2 Merkle trees, and related paths.
+
+The Rust package name in `Cargo.toml` remains `whir-p3` for compatibility with
+upstream imports.
+
+**Canonical repository**: [github.com/privacy-ethereum/whir-p3-metal](https://github.com/privacy-ethereum/whir-p3-metal)
+
+Links between Markdown files in this repo use **relative paths** (for example
+[`docs/gpu-optimizations.md`](docs/gpu-optimizations.md)) so they resolve on
+whatever GitHub org or fork you are viewing.
 
 ## GPU acceleration (Apple Silicon / Metal)
 
@@ -151,7 +165,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --default-t
 source "$HOME/.cargo/env"
 
 # 2. Clone and run
-git clone https://github.com/miha-stopar/whir-p3-metal.git
+git clone https://github.com/privacy-ethereum/whir-p3-metal.git
 cd whir-p3-metal
 ./bench.sh
 ```
