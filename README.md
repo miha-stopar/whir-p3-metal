@@ -10,12 +10,6 @@ Poseidon2 Merkle trees, and related paths.
 The Rust package name in `Cargo.toml` remains `whir-p3` for compatibility with
 upstream imports.
 
-**Canonical repository**: [github.com/privacy-ethereum/whir-p3-metal](https://github.com/privacy-ethereum/whir-p3-metal)
-
-Links between Markdown files in this repo use **relative paths** (for example
-[`docs/gpu-optimizations.md`](docs/gpu-optimizations.md)) so they resolve on
-whatever GitHub org or fork you are viewing.
-
 ## GPU acceleration (Apple Silicon / Metal)
 
 Enable with `--features gpu-metal`. Accelerates the `whir_prove` pipeline by
