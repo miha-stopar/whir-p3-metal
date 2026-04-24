@@ -50,7 +50,7 @@ Our work focuses on a specific, practically relevant target: accelerating the **
 
 ## 2. WHIR: Background
 
-[WHIR](https://eprint.iacr.org/2024/1586) (Fenzi, Hauck, Nghiem; published at [EUROCRYPT 2025](https://iacr.org/cryptodb/data/paper.php?pubkey=35004)) is an Interactive Oracle Proof of proximity for Reed-Solomon codes. It serves as an efficient replacement for [FRI](https://eccc.weizmann.ac.il/report/2017/134/), [STIR](https://eprint.iacr.org/2024/390), and [BaseFold](https://eprint.iacr.org/2023/1705), with notably fast verification (hundreds of microseconds vs. milliseconds for alternatives).
+[WHIR](https://eprint.iacr.org/2024/1586) (Gal Arnon, Weizmann Institute; Alessandro Chiesa, EPFL; Giacomo Fenzi, EPFL; Eylon Yogev, Bar-Ilan University; published at [EUROCRYPT 2025](https://iacr.org/cryptodb/data/paper.php?pubkey=35004)) is an Interactive Oracle Proof of proximity for Reed-Solomon codes. It serves as an efficient replacement for [FRI](https://eccc.weizmann.ac.il/report/2017/134/), [STIR](https://eprint.iacr.org/2024/390), and [BaseFold](https://eprint.iacr.org/2023/1705), with notably fast verification (hundreds of microseconds vs. milliseconds for alternatives).
 
 For proving, the dominant costs are:
 
