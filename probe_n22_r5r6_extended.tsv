@@ -1,0 +1,13 @@
+n	fold	rate	mode	seconds
+22	6	5	cpu	84.7806
+22	6	5	gpu	timeout
+22	6	5	gpu_fused	timeout
+22	6	5	gpu_grind	fail
+22	1	6	cpu	34.2695
+22	1	6	gpu	fail
+22	1	6	gpu_fused	fail
+22	1	6	gpu_grind	fail
+22	2	6	cpu	16.1251
+22	2	6	gpu	11.9861
+22	2	6	gpu_fused	7.7750
+22	2	6	gpu_grind	9.2688

@@ -201,6 +201,36 @@ The entire Montgomery multiply uses just 2 `mul` + 2 `mulhi` + 1 subtract + 1 co
 | 6    | 3    | 1763     | 1320          | **1.34x** |
 
 
+#### n=22, rate > 3 (extended)
+
+For `rate > 3`, the evaluation domain and intermediate buffers grow quickly. The Metal dispatch path applies conservative **defaults** (see `gpu_dft.rs`): roughly **`log_n <= 24`** and **1 GiB** of GPU-eligible storage (`WHIR_GPU_MAX_LOG_N` / `WHIR_GPU_MAX_TOTAL_BYTES`). Without raising those, n=22 at higher rates usually **stays on CPU** or hits the same class of cap as in the n=24 note below.
+
+The rows below use the **same hardware and methodology** as the main tables (3 runs per mode, **median** reported; **Best GPU** = minimum of the medians for `gpu`, `gpu_fused`, and `gpu_grind`). Before running, set:
+
+```bash
+export WHIR_GPU_MAX_LOG_N=28
+export WHIR_GPU_MAX_TOTAL_BYTES=4294967296   # 4 GiB
+./bench.sh 22 1 5   # example: single (n, fold, rate)
+```
+
+| fold | rate | CPU (ms) | Best GPU (ms) | Speedup   |
+| ---- | ---- | -------- | ------------- | --------- |
+| 1    | 5    | 15226    | 9300          | **1.64x** |
+| 2    | 5    | 6327     | 3644          | **1.74x** |
+| 3    | 5    | 8694     | 3779          | **2.30x** |
+| 4    | 5    | 7546     | 4568          | **1.65x** |
+| 2    | 6    | 17142    | 8408          | **2.04x** |
+
+**Why some (n, fold, rate) pairs fail or are omitted.** This is not the same closed 29-config grid as above; GPU at `rate > 3` is **experimental**.
+
+- **Domain and memory caps**: If buffers exceed the default `log_n` or byte budget, the code **refuses GPU** and uses CPU (by design). The env overrides above relax that for benchmarking only; you need enough **unified memory** headroom.
+- **(n=22, fold=1, rate=6)**: In our runs, **every GPU mode exited without a usable timing** (no successful GPU proof timing), while CPU still completed. Likely interaction of **very large allocations** with the Metal pipeline or a bug in an edge-case layout—not investigated to root cause here.
+- **(n=22, fold=6, rate=5)**: **CPU** completed in O(10²) seconds in probes, but **GPU runs did not finish** in practical wall time (hang or extreme PoW variance on the GPU path). High **fold** increases the number of rounds and **Fiat–Shamir grinding**; combined with a large domain, the accelerated path is much less predictable than at fold 1–4.
+- **Driver and stability**: On aggressive settings, the GPU process can **abort** (e.g. signal exit) on some machines—another reason defaults stay conservative.
+
+At these parameters, **GRIND** often supplies the best GPU median when PoW dominates; **FUSED** still wins on some rows (for example fold=1, rate=5 here).
+
+
 #### n=24 (16M coefficients)
 
 
@@ -217,7 +247,7 @@ The entire Montgomery multiply uses just 2 `mul` + 2 `mulhi` + 1 subtract + 1 co
 
 ### Key Observations
 
-**GPU is faster than CPU for all 29 tested configurations at n >= 20.** The speedup ranges from 1.25x to 2.03x, with the best results at low fold values and higher rates.
+**GPU is faster than CPU for all 29 tested configurations at n >= 20** in the main grid above. The speedup ranges from 1.25x to 2.03x, with the best results at low fold values and higher rates. **n=22, rate > 3** is a smaller, separately documented set (see table): GPU still wins on the configurations we could measure medians for, but other high-rate pairs fail caps, time out, or crash as described there.
 
 **Low fold values give the best speedups** (1.5-2.0x at fold=1-2) because the NTT and Merkle tree dominate the runtime -- exactly the operations we accelerated. Higher fold values (fold=4-6) reduce the number of NTT elements per round but increase the number of rounds and PoW grinding, shifting work toward sumcheck (where GPU parallelism is harder to exploit -- see discussion in Section 7).
 

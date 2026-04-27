@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::mem::size_of;
 use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use metal::{
     Buffer, CompileOptions, ComputeCommandEncoderRef, ComputePipelineState, Device,
@@ -471,6 +471,28 @@ impl MetalBabyBearDft {
     const GPU_MIN_TOTAL_BYTES: usize = 256 * 1024;
     /// Default Poseidon2 RNG seed (must match the seed used to construct the permutation).
     const DEFAULT_POSEIDON2_SEED: u64 = 1;
+
+    /// Override with `WHIR_GPU_MAX_LOG_N=<u32>` for probing larger domains.
+    fn gpu_max_log_n() -> u32 {
+        static VALUE: OnceLock<u32> = OnceLock::new();
+        *VALUE.get_or_init(|| {
+            std::env::var("WHIR_GPU_MAX_LOG_N")
+                .ok()
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(Self::GPU_MAX_LOG_N)
+        })
+    }
+
+    /// Override with `WHIR_GPU_MAX_TOTAL_BYTES=<usize>` for probing.
+    fn gpu_max_total_bytes() -> usize {
+        static VALUE: OnceLock<usize> = OnceLock::new();
+        *VALUE.get_or_init(|| {
+            std::env::var("WHIR_GPU_MAX_TOTAL_BYTES")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(Self::GPU_MAX_TOTAL_BYTES)
+        })
+    }
 
     pub fn new(max_fft_size: usize) -> Self {
         Self::new_with_params(
@@ -1185,11 +1207,11 @@ impl MetalBabyBearDft {
         width: usize,
     ) -> Option<GpuMerkleResult> {
         let log_n = log2_strict_usize(height) as u32;
-        if log_n < self.gpu_min_log_n || log_n > Self::GPU_MAX_LOG_N {
+        if log_n < self.gpu_min_log_n || log_n > Self::gpu_max_log_n() {
             return None;
         }
         let total_bytes_val = height * width * size_of::<u32>();
-        if total_bytes_val > Self::GPU_MAX_TOTAL_BYTES || total_bytes_val < Self::GPU_MIN_TOTAL_BYTES {
+        if total_bytes_val > Self::gpu_max_total_bytes() || total_bytes_val < Self::GPU_MIN_TOTAL_BYTES {
             return None;
         }
 
@@ -1368,11 +1390,11 @@ impl MetalBabyBearDft {
         let total_out = out_height * out_width;
         let log_n = log2_strict_usize(out_height) as u32;
 
-        if log_n < self.gpu_min_log_n || log_n > Self::GPU_MAX_LOG_N {
+        if log_n < self.gpu_min_log_n || log_n > Self::gpu_max_log_n() {
             return None;
         }
         let total_bytes_val = total_out * size_of::<u32>();
-        if total_bytes_val > Self::GPU_MAX_TOTAL_BYTES || total_bytes_val < Self::GPU_MIN_TOTAL_BYTES {
+        if total_bytes_val > Self::gpu_max_total_bytes() || total_bytes_val < Self::GPU_MIN_TOTAL_BYTES {
             return None;
         }
 
@@ -2006,11 +2028,11 @@ impl MetalBabyBearDft {
 
     fn try_gpu_dft_inplace(&self, values: &mut Vec<BabyBear>, height: usize, width: usize) -> Option<()> {
         let log_n = log2_strict_usize(height) as u32;
-        if log_n < self.gpu_min_log_n || log_n > Self::GPU_MAX_LOG_N {
+        if log_n < self.gpu_min_log_n || log_n > Self::gpu_max_log_n() {
             return None;
         }
         let total_bytes_val = height * width * size_of::<u32>();
-        if total_bytes_val > Self::GPU_MAX_TOTAL_BYTES || total_bytes_val < Self::GPU_MIN_TOTAL_BYTES {
+        if total_bytes_val > Self::gpu_max_total_bytes() || total_bytes_val < Self::GPU_MIN_TOTAL_BYTES {
             return None;
         }
 
