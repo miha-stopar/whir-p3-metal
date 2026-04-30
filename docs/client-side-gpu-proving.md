@@ -2,7 +2,7 @@
 
 ## TL;DR
 
-We accelerated the [WHIR](https://eprint.iacr.org/2024/1586) prover on Apple Silicon GPUs using Metal compute shaders, achieving **up to 2.03x speedup** over highly optimized CPU code (SIMD + LTO + `target-cpu=native`) on an M1 chip. The GPU pipeline fuses NTT (Number Theoretic Transform), bit-reversal, Poseidon2 Merkle tree hashing, and proof-of-work grinding into single command buffer submissions, exploiting Apple Silicon's unified memory architecture. The implementation is open source and runs on any Mac with Apple Silicon, with an iOS benchmark app for iPhone testing.
+We accelerated the [WHIR](https://eprint.iacr.org/2024/1586) prover on Apple Silicon GPUs using Metal compute shaders, achieving **up to 2.03x speedup** over highly optimized CPU code (SIMD + LTO + `target-cpu=native`) on an M1 chip, **up to 2.58x** on a supplementary Apple M3 MacBook run, and **about 1.4-2.3x** on a sparse sample from the **WHIR Bench** iOS app (Metal **Apple A19** GPU; see Section 4). The GPU pipeline fuses NTT (Number Theoretic Transform), bit-reversal, Poseidon2 Merkle tree hashing, and proof-of-work grinding into single command buffer submissions, exploiting Apple Silicon's unified memory architecture. The implementation is open source and runs on any Mac with Apple Silicon, with that same app for on-device iPhone testing.
 
 **Key findings:**
 
@@ -245,9 +245,153 @@ At these parameters, **GRIND** often supplies the best GPU median when PoW domin
 
 > n=24 rate>=2 exceeds the GPU domain cap (2^25 elements) and is not tested.
 
+### Supplementary: Apple M3 MacBook
+
+The tables below repeat the same parameter meanings as above on a different machine for readers on newer Apple Silicon. **Best GPU** is the minimum of the three GPU modes (`GPU`, `FUSED`, `GRIND`) per row, matching the M1 tables.
+
+- **Hardware**: Apple M3 (MacBook, unified memory)
+- **Software**: Rust 1.95.0 (2026-04-14), macOS 15.7.5 (arm64), release build with the same class of optimizations as the M1 run (LTO, native CPU codegen for the baseline)
+- **Methodology**: 3 runs per configuration, **median** reported for each column; speedup = CPU median / Best GPU median
+- **Date**: 2026-04-27
+
+#### n=20 (1M coefficients)
+
+| fold | rate | CPU (ms) | Best GPU (ms) | Speedup   |
+| ---- | ---- | -------- | ------------- | --------- |
+| 1    | 1    | 202.4    | 109.8         | **1.84x** |
+| 1    | 2    | 349.3    | 174.7         | **2.00x** |
+| 1    | 3    | 616.3    | 290.3         | **2.12x** |
+| 2    | 1    | 83.4     | 51.9          | **1.61x** |
+| 2    | 2    | 138.8    | 78.8          | **1.76x** |
+| 2    | 3    | 262.2    | 136.9         | **1.92x** |
+| 4    | 1    | 30.8     | 28.1          | **1.10x** |
+| 4    | 2    | 55.2     | 39.2          | **1.41x** |
+| 4    | 3    | 113.5    | 85.5          | **1.33x** |
+
+#### n=22 (4M coefficients)
+
+| fold | rate | CPU (ms) | Best GPU (ms) | Speedup   |
+| ---- | ---- | -------- | ------------- | --------- |
+| 1    | 1    | 744.0    | 394.3         | **1.89x** |
+| 1    | 2    | 1557.9   | 617.9         | **2.52x** |
+| 1    | 3    | 3006.7   | 1164.2        | **2.58x** |
+| 2    | 1    | 704.9    | 173.4         | **4.07x** |
+| 2    | 2    | 618.0    | 297.3         | **2.08x** |
+| 2    | 3    | 1210.2   | 552.3         | **2.19x** |
+| 3    | 1    | 172.7    | 97.3          | **1.77x** |
+| 3    | 2    | 316.5    | 164.4         | **1.93x** |
+| 3    | 3    | 617.3    | 385.6         | **1.60x** |
+| 4    | 1    | 121.3    | 79.9          | **1.52x** |
+| 4    | 2    | 226.1    | 141.0         | **1.60x** |
+| 4    | 3    | 510.6    | 382.9         | **1.33x** |
+| 6    | 1    | 108.8    | 72.4          | **1.50x** |
+| 6    | 2    | 335.3    | 242.5         | **1.38x** |
+| 6    | 3    | 1573.3   | 1064.1        | **1.48x** |
+
+At **(n=22, fold=2, rate=1)** the M3 sheet shows a **4.07x** Best GPU speedup; that row is an outlier relative to the rest of the grid and to the M1 n=22 fold=2 rate=1 cell (**1.54x**). Treat it as worth re-running (PoW variance, thermal state, or an uncharacteristic CPU median) before drawing a strong conclusion.
+
+#### n=24 (16M coefficients)
+
+| fold | rate | CPU (ms) | Best GPU (ms) | Speedup   |
+| ---- | ---- | -------- | ------------- | --------- |
+| 1    | 1    | 3390.6   | 1432.3        | **2.37x** |
+| 2    | 1    | 1538.3   | 688.7         | **2.23x** |
+| 3    | 1    | 708.5    | 370.8         | **1.91x** |
+| 4    | 1    | 809.7    | 549.3         | **1.47x** |
+| 6    | 1    | 438.5    | 333.7         | **1.31x** |
+
+Raw machine-readable output (same numbers as above):
+
+```
+# whir-p3-metal GPU benchmark
+# Date:  Mon Apr 27 20:23:34 CST 2026
+# Rust:  rustc 1.95.0 (59807616e 2026-04-14)
+# Host:  arm64 macOS 15.7.5
+# Chip:  Apple M3
+# Runs:  3 per config (median reported)
+#
+n      fold   rate      CPU(ms)    GPU(ms)  FUSED(ms)  GRIND(ms)    speedup
+--------------------------------------------------------------------------------
+20     1      1           202.4      125.2      109.8      110.1      1.84x
+20     1      2           349.3      189.4      174.7      186.7      2.00x
+20     1      3           616.3      314.9      291.3      290.3      2.12x
+20     2      1            83.4       57.6       51.9       52.1      1.61x
+20     2      2           138.8       87.1       79.4       78.8      1.76x
+20     2      3           262.2      152.1      139.0      136.9      1.92x
+20     4      1            30.8       28.1       28.9       29.7      1.10x
+20     4      2            55.2       44.2       39.2       43.1      1.41x
+20     4      3           113.5      102.8       87.0       85.5      1.33x
+22     1      1           744.0      442.6      398.1      394.3      1.89x
+22     1      2          1557.9      683.8      619.3      617.9      2.52x
+22     1      3          3006.7     1314.3     1164.2     1183.6      2.58x
+22     2      1           704.9      208.4      173.4      178.4      4.07x
+22     2      2           618.0      323.8      297.3      302.4      2.08x
+22     2      3          1210.2      618.2      559.8      552.3      2.19x
+22     3      1           172.7      113.7       97.3       97.4      1.77x
+22     3      2           316.5      194.2      164.4      166.6      1.93x
+22     3      3           617.3      385.6      427.6      412.8      1.60x
+22     4      1           121.3       84.9       80.1       79.9      1.52x
+22     4      2           226.1      156.5      147.5      141.0      1.60x
+22     4      3           510.6      382.9      383.3      413.2      1.33x
+22     6      1           108.8       79.7       79.5       72.4      1.50x
+22     6      2           335.3      242.5      277.4      335.8      1.38x
+22     6      3          1573.3     1478.6     1626.7     1064.1      1.48x
+24     1      1          3390.6     1818.0     1436.9     1432.3      2.37x
+24     2      1          1538.3      824.6      718.7      688.7      2.23x
+24     3      1           708.5      486.1      410.6      370.8      1.91x
+24     4      1           809.7      703.1      633.2      549.3      1.47x
+24     6      1           438.5      367.2      333.7      347.6      1.31x
+```
+
+### Supplementary: iPhone (WHIR Bench, Apple A19 GPU)
+
+The iOS app reports wall times in milliseconds for a **single GPU mode** per tap (not the Mac `bench.sh` grid of FUSED/GRIND variants). The table below is a **sparse** set of configurations (not the full M1 29-cell grid). Speedup is CPU time divided by GPU time for each row.
+
+- **App**: WHIR Bench (project `ios/` target)
+- **GPU**: Metal reports **Apple A19 GPU**
+- **Units**: milliseconds; values as shown in the app export
+
+| n  | fold | rate | CPU (ms) | GPU (ms) | Speedup   |
+| -- | ---- | ---- | -------- | -------- | --------- |
+| 20 | 1    | 1    | 240      | 133      | **1.8x**  |
+| 20 | 2    | 2    | 196      | 105      | **1.9x**  |
+| 20 | 4    | 3    | 207      | 121      | **1.7x**  |
+| 22 | 1    | 1    | 1068     | 486      | **2.2x**  |
+| 22 | 1    | 2    | 1942     | 886      | **2.2x**  |
+| 22 | 2    | 1    | 482      | 238      | **2.0x**  |
+| 22 | 3    | 2    | 437      | 246      | **1.8x**  |
+| 22 | 4    | 3    | 739      | 517      | **1.4x**  |
+| 24 | 1    | 1    | 4618     | 2019     | **2.3x**  |
+| 24 | 2    | 1    | 2017     | 976      | **2.1x**  |
+| 24 | 3    | 1    | 1055     | 540      | **2.0x**  |
+| 24 | 4    | 1    | 1197     | 845      | **1.4x**  |
+
+Raw copy of the in-app summary:
+
+```
+# WHIR Bench
+
+Metal: Apple A19 GPU
+
+| n | fold | rate | CPU | GPU | Speed |
+|---|------|------|------|------|-------|
+| 20 | 1 | 1 | 240 | 133 | 1.8x |
+| 20 | 2 | 2 | 196 | 105 | 1.9x |
+| 20 | 4 | 3 | 207 | 121 | 1.7x |
+| 22 | 1 | 1 | 1068 | 486 | 2.2x |
+| 22 | 1 | 2 | 1942 | 886 | 2.2x |
+| 22 | 2 | 1 | 482 | 238 | 2.0x |
+| 22 | 3 | 2 | 437 | 246 | 1.8x |
+| 22 | 4 | 3 | 739 | 517 | 1.4x |
+| 24 | 1 | 1 | 4618 | 2019 | 2.3x |
+| 24 | 2 | 1 | 2017 | 976 | 2.1x |
+| 24 | 3 | 1 | 1055 | 540 | 2.0x |
+| 24 | 4 | 1 | 1197 | 845 | 1.4x |
+```
+
 ### Key Observations
 
-**GPU is faster than CPU for all 29 tested configurations at n >= 20** in the main grid above. The speedup ranges from 1.25x to 2.03x, with the best results at low fold values and higher rates. **n=22, rate > 3** is a smaller, separately documented set (see table): GPU still wins on the configurations we could measure medians for, but other high-rate pairs fail caps, time out, or crash as described there.
+**GPU is faster than CPU for all 29 tested configurations at n >= 20** in the main M1 grid above. The speedup ranges from 1.25x to 2.03x, with the best results at low fold values and higher rates. On the **M3** supplementary grid (Section 4), every listed configuration also beats CPU on Best GPU, with most speedups between **1.10x** and **2.58x**, plus one **(n=22, fold=2, rate=1)** outlier at **4.07x** (see note there). The **iPhone (A19)** WHIR Bench sample in Section 4 also shows GPU faster than CPU on every listed row (**~1.4-2.3x**), with the same qualitative pattern that **fold=4** rows are the tightest. **n=22, rate > 3** is a smaller, separately documented set (see table): GPU still wins on the configurations we could measure medians for, but other high-rate pairs fail caps, time out, or crash as described there.
 
 **Low fold values give the best speedups** (1.5-2.0x at fold=1-2) because the NTT and Merkle tree dominate the runtime -- exactly the operations we accelerated. Higher fold values (fold=4-6) reduce the number of NTT elements per round but increase the number of rounds and PoW grinding, shifting work toward sumcheck (where GPU parallelism is harder to exploit -- see discussion in Section 7).
 
@@ -403,6 +547,8 @@ In practice, this was **20% slower** than our flat DIF approach because:
 | Project                | Target         | Protocol       | Speedup             | Field             | API    | Source                                                                                                        |
 | ---------------------- | -------------- | -------------- | ------------------- | ----------------- | ------ | ------------------------------------------------------------------------------------------------------------- |
 | **This work**          | Apple M1 GPU   | WHIR/Poseidon2 | **1.3-2.0x** vs CPU | BabyBear (31-bit) | Metal  | [repo](https://github.com/privacy-ethereum/whir-p3-metal)                                                     |
+| **This work** (M3 run) | Apple M3 GPU   | WHIR/Poseidon2 | **1.1-2.6x** vs CPU (see §4; one cell **~4.1x**) | BabyBear (31-bit) | Metal  | same                                                                                                  |
+| **This work** (iPhone) | Apple A19 GPU  | WHIR/Poseidon2 | **~1.4-2.3x** vs CPU (sparse WHIR Bench sample, §4) | BabyBear (31-bit) | Metal  | same                                                                                              |
 | Mopro Metal MSM v2     | Apple GPU      | MSM (BN254)    | 40-100x vs v1       | BN254 (254-bit)   | Metal  | [write-up](https://zkmopro.org/blog/metal-msm-v2/), [code](https://github.com/zkmopro/gpu-acceleration)       |
 | ICICLE Metal v3.6      | Apple GPU      | MSM, NTT       | up to 5x            | Multiple          | Metal  | [blog](https://medium.com/@ingonyama/icicle-goes-metal-v3-6-163fa7bbfa44), [docs](https://dev.ingonyama.com/) |
 | ICICLE-Stwo (CUDA)     | Datacenter GPU | Circle STARK   | 3.25-7x vs CPU SIMD | M31 (31-bit)      | CUDA   | [blog](https://medium.com/@ingonyama/introducing-icicle-stwo-a-gpu-accelerated-stwo-prover-550b413d4f88)      |
@@ -428,7 +574,7 @@ The Poseidon2 Merkle kernel dominates runtime (58%). A 4-ary or 8-ary tree would
 
 ### Newer Apple Silicon
 
-Our benchmarks are on M1 (2020). The M4 Max has 40 GPU cores (vs 8 on M1) and 273 GB/s memory bandwidth (vs 68 GB/s). We expect 3-4x improvement from hardware alone. The repository includes a `bench.sh` script and an iOS app to make cross-device benchmarking easy -- contributions welcome.
+Our primary published numbers are on M1 (2020). An M3 MacBook run (Section 4) shows the same qualitative story with often higher speedups on large `n` (for example **2.37x** at n=24, fold=1, rate=1 vs **1.69x** on M1 for the same cell). WHIR Bench on iPhone (A19, Section 4) lands in a similar band for the sampled cells (**2.3x** at n=24, fold=1, rate=1). The M4 Max has 40 GPU cores (vs 8 on M1) and 273 GB/s memory bandwidth (vs 68 GB/s). We expect further gains from newer chips; the repository includes a `bench.sh` script and the iOS app to make cross-device benchmarking easy -- contributions welcome.
 
 ### WebGPU backend
 
