@@ -300,56 +300,13 @@ At **(n=22, fold=2, rate=1)** the M3 sheet shows a **4.07x** Best GPU speedup; t
 | 4    | 1    | 809.7    | 549.3         | **1.47x** |
 | 6    | 1    | 438.5    | 333.7         | **1.31x** |
 
-Raw machine-readable output (same numbers as above):
-
-```
-# whir-p3-metal GPU benchmark
-# Date:  Mon Apr 27 20:23:34 CST 2026
-# Rust:  rustc 1.95.0 (59807616e 2026-04-14)
-# Host:  arm64 macOS 15.7.5
-# Chip:  Apple M3
-# Runs:  3 per config (median reported)
-#
-n      fold   rate      CPU(ms)    GPU(ms)  FUSED(ms)  GRIND(ms)    speedup
---------------------------------------------------------------------------------
-20     1      1           202.4      125.2      109.8      110.1      1.84x
-20     1      2           349.3      189.4      174.7      186.7      2.00x
-20     1      3           616.3      314.9      291.3      290.3      2.12x
-20     2      1            83.4       57.6       51.9       52.1      1.61x
-20     2      2           138.8       87.1       79.4       78.8      1.76x
-20     2      3           262.2      152.1      139.0      136.9      1.92x
-20     4      1            30.8       28.1       28.9       29.7      1.10x
-20     4      2            55.2       44.2       39.2       43.1      1.41x
-20     4      3           113.5      102.8       87.0       85.5      1.33x
-22     1      1           744.0      442.6      398.1      394.3      1.89x
-22     1      2          1557.9      683.8      619.3      617.9      2.52x
-22     1      3          3006.7     1314.3     1164.2     1183.6      2.58x
-22     2      1           704.9      208.4      173.4      178.4      4.07x
-22     2      2           618.0      323.8      297.3      302.4      2.08x
-22     2      3          1210.2      618.2      559.8      552.3      2.19x
-22     3      1           172.7      113.7       97.3       97.4      1.77x
-22     3      2           316.5      194.2      164.4      166.6      1.93x
-22     3      3           617.3      385.6      427.6      412.8      1.60x
-22     4      1           121.3       84.9       80.1       79.9      1.52x
-22     4      2           226.1      156.5      147.5      141.0      1.60x
-22     4      3           510.6      382.9      383.3      413.2      1.33x
-22     6      1           108.8       79.7       79.5       72.4      1.50x
-22     6      2           335.3      242.5      277.4      335.8      1.38x
-22     6      3          1573.3     1478.6     1626.7     1064.1      1.48x
-24     1      1          3390.6     1818.0     1436.9     1432.3      2.37x
-24     2      1          1538.3      824.6      718.7      688.7      2.23x
-24     3      1           708.5      486.1      410.6      370.8      1.91x
-24     4      1           809.7      703.1      633.2      549.3      1.47x
-24     6      1           438.5      367.2      333.7      347.6      1.31x
-```
-
 ### Supplementary: iPhone (WHIR Bench, Apple A19 GPU)
 
 The iOS app reports wall times in milliseconds for a **single GPU mode** per tap (not the Mac `bench.sh` grid of FUSED/GRIND variants). The table below is a **sparse** set of configurations (not the full M1 29-cell grid). Speedup is CPU time divided by GPU time for each row.
 
 - **App**: WHIR Bench (project `ios/` target)
 - **GPU**: Metal reports **Apple A19 GPU**
-- **Units**: milliseconds; values as shown in the app export
+- **Units**: milliseconds (on-device WHIR Bench run)
 
 | n  | fold | rate | CPU (ms) | GPU (ms) | Speedup   |
 | -- | ---- | ---- | -------- | -------- | --------- |
@@ -365,29 +322,6 @@ The iOS app reports wall times in milliseconds for a **single GPU mode** per tap
 | 24 | 2    | 1    | 2017     | 976      | **2.1x**  |
 | 24 | 3    | 1    | 1055     | 540      | **2.0x**  |
 | 24 | 4    | 1    | 1197     | 845      | **1.4x**  |
-
-Raw copy of the in-app summary:
-
-```
-# WHIR Bench
-
-Metal: Apple A19 GPU
-
-| n | fold | rate | CPU | GPU | Speed |
-|---|------|------|------|------|-------|
-| 20 | 1 | 1 | 240 | 133 | 1.8x |
-| 20 | 2 | 2 | 196 | 105 | 1.9x |
-| 20 | 4 | 3 | 207 | 121 | 1.7x |
-| 22 | 1 | 1 | 1068 | 486 | 2.2x |
-| 22 | 1 | 2 | 1942 | 886 | 2.2x |
-| 22 | 2 | 1 | 482 | 238 | 2.0x |
-| 22 | 3 | 2 | 437 | 246 | 1.8x |
-| 22 | 4 | 3 | 739 | 517 | 1.4x |
-| 24 | 1 | 1 | 4618 | 2019 | 2.3x |
-| 24 | 2 | 1 | 2017 | 976 | 2.1x |
-| 24 | 3 | 1 | 1055 | 540 | 2.0x |
-| 24 | 4 | 1 | 1197 | 845 | 1.4x |
-```
 
 ### Key Observations
 
